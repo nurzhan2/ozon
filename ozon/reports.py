@@ -1,0 +1,622 @@
+# -*- coding: utf-8 -*-
+"""
+Пять отчётов OZON — макеты строго по образцам заказчика.
+
+  1) cumulative  «Общая сводная по продажам» — один лист, магазины блоками,
+                 колонки = дни (с 1-го числа по вчера), «Общий итог», «ср/день».
+                 Образец: Отчет неделя_кол-во.xlsx
+  2) dod         «Динамика день ко дню» — лист на магазин, три блока:
+                 вчера / позавчера / динамика. Колонки: Сумма, Количество,
+                 реклама, ДРР, Показы + строка «Итог».
+                 Образец: динамика день ко дню (лист 3).csv
+  3) quality     «Качественные показатели по каждому товару» — лист на магазин,
+                 блок на товар: строки-метрики (показы, клики, CTR, корзина,
+                 % корзины, купили без отмен, отмен, место в поиске, оборот,
+                 реклама, ДРР %), колонки = дни. Накопительно, только на остатках.
+  4) stocks      «По каждой позиции на остатках» — лист на магазин, строки
+                 артикул × кластер: Доступно к продаже, В заявках на поставку,
+                 В поставках в пути, Итог, прод 7д, среднее, потреб 30д,
+                 потреб 45д, на сколько дней хватит остатков (формулы Excel).
+                 Образец: Распред мазь 5 ядов Бьютифул.xlsx
+  5) intraday    Тот же макет, что 2, но сегодня на время T к вчера на время T.
+
+Во всех отчётах исключаются артикулы с меткой OUT; накопительные и
+качественные строятся только по товарам, у которых есть остаток.
+"""
+
+import os
+import logging
+from datetime import timedelta
+
+from openpyxl import Workbook
+
+from . import excel as X
+from . import dates as D
+from . import snapshots as S
+from . import processing as P
+
+log = logging.getLogger("ozon.reports")
+
+
+# ============================================================ утилиты
+
+def _out(cfg, filename):
+    os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
+    return os.path.join(cfg.OUTPUT_DIR, filename)
+
+
+def _new_wb():
+    wb = Workbook()
+    wb.remove(wb.active)
+    return wb
+
+
+def _daterange(date_from, date_to):
+    days, cur = [], date_from
+    while cur <= date_to:
+        days.append(cur)
+        cur += timedelta(days=1)
+    return days
+
+
+def _period(cfg):
+    """Период накопительных отчётов: с 1-го числа по вчера (или последние N дней)."""
+    tz = cfg.TIMEZONE
+    date_to = D.yesterday(tz)
+    n = getattr(cfg, "CUMULATIVE_DAYS", 0)
+    if n and n > 0:
+        return date_to - timedelta(days=n - 1), date_to
+    return D.month_start(ref=date_to, tz_name=tz), date_to
+
+
+def _safe_div(a, b):
+    return (a / b) if b else 0.0
+
+
+# ============================================================ 1. Общая сводная
+
+def build_cumulative_sales(collectors, cfg):
+    """Магазины блоками на одном листе, дни колонками, продажи в штуках."""
+    tz = cfg.TIMEZONE
+    date_from, date_to = _period(cfg)
+    days = _daterange(date_from, date_to)
+    day_keys = [D.d(x) for x in days]
+    stamp = D.now_tz(tz).strftime("%Y-%m-%d")
+
+    wb = _new_wb()
+    ws = wb.create_sheet(X.safe_title(date_to.strftime("%d.%m")))
+
+    r = 1
+    for colr in collectors:
+        daily, _ = colr.daily_by_product(date_from, date_to, only_in_stock=True)
+
+        # строки: товар + продажи по дням
+        rows = []
+        for rec in daily.values():
+            per_day = [int(round(rec["days"].get(k, {}).get("ordered_units", 0) or 0))
+                       for k in day_keys]
+            total = sum(per_day)
+            if total <= 0:
+                continue
+            rows.append((rec["name"] or rec["offer_id"], per_day, total))
+        rows.sort(key=lambda x: x[2], reverse=True)
+
+        # --- шапка блока ---
+        c = ws.cell(r, 1, value=colr.name)
+        X.style_header_cell(c, yellow=True)
+        for i, dt in enumerate(days):
+            c = ws.cell(r, 2 + i, value=dt)
+            X.style_header_cell(c)
+            c.number_format = X.FMT_DATE
+        c = ws.cell(r, 2 + len(days), value="Общий итог")
+        X.style_header_cell(c)
+        c = ws.cell(r, 3 + len(days), value="ср/день")
+        X.style_header_cell(c)
+
+        first_data_row = r + 1
+        for name, per_day, total in rows:
+            r += 1
+            cc = ws.cell(r, 1, value=name)
+            X.style_body_cell(cc)
+            cc.alignment = X.LEFT
+            for i, v in enumerate(per_day):
+                X.style_body_cell(ws.cell(r, 2 + i, value=v), X.FMT_INT)
+            X.style_body_cell(ws.cell(r, 2 + len(days), value=total), X.FMT_INT, bold=True)
+            avg = round(total / len(days)) if days else 0
+            X.style_body_cell(ws.cell(r, 3 + len(days), value=avg), X.FMT_INT, bold=True)
+
+        # --- цветовые шкалы: отдельно на дни и на «Общий итог» (как в образце) ---
+        if rows:
+            X.color_scale(ws, f"B{first_data_row}:{X.col(1 + len(days))}{r}")
+            X.color_scale(ws, f"{X.col(2 + len(days))}{first_data_row}:"
+                              f"{X.col(2 + len(days))}{r}")
+        r += 2   # пустая строка между магазинами
+
+    X.set_widths(ws, [40] + [10] * len(days) + [13, 10])
+    ws.freeze_panes = "B2"
+    X.page_setup(ws)
+
+    path = _out(cfg, f"01_svodnaya_prodazhi_{stamp}.xlsx")
+    wb.save(path)
+    log.info("отчёт 1 готов: %s", path)
+    return path
+
+
+# ============================================================ 2 и 5. Динамика
+
+DOD_COLUMNS = [
+    ("revenue", "Сумма", X.FMT_MONEY),
+    ("ordered_units", "Количество", X.FMT_INT),
+    ("ad_spend", "реклама", X.FMT_MONEY),
+    ("drr", "ДРР", X.FMT_PCT),
+    ("hits_view", "Показы", X.FMT_INT),
+]
+
+
+def _dod_block(ws, r, title, rows, totals):
+    """
+    Один блок таблицы: шапка (жёлтая ячейка с подписью периода) + товары + Итог.
+    rows: список (название, {метрика: значение}); totals: {метрика: значение}.
+    Возвращает номер следующей свободной строки.
+    """
+    c = ws.cell(r, 1, value=title)
+    X.style_header_cell(c, yellow=True)
+    for i, (_, header, _) in enumerate(DOD_COLUMNS):
+        X.style_header_cell(ws.cell(r, 2 + i, value=header))
+
+    first = r + 1
+    for name, vals in rows:
+        r += 1
+        cc = ws.cell(r, 1, value=name)
+        X.style_body_cell(cc)
+        cc.alignment = X.LEFT
+        for i, (key, _, fmt) in enumerate(DOD_COLUMNS):
+            X.style_body_cell(ws.cell(r, 2 + i, value=vals.get(key, 0)), fmt)
+    last = r
+
+    # строка «Итог»
+    r += 1
+    cc = ws.cell(r, 1, value="Итог")
+    X.style_body_cell(cc, bold=True)
+    cc.fill = X.FILL_TOTAL
+    cc.alignment = X.LEFT
+    for i, (key, _, fmt) in enumerate(DOD_COLUMNS):
+        cc = ws.cell(r, 2 + i, value=totals.get(key, 0))
+        X.style_body_cell(cc, fmt, bold=True)
+        cc.fill = X.FILL_TOTAL
+
+    if last >= first:
+        for i in range(len(DOD_COLUMNS)):
+            letter = X.col(2 + i)
+            X.color_scale(ws, f"{letter}{first}:{letter}{last}")
+    return r + 2
+
+
+def _agg(rec, day_keys):
+    """Свод метрик товара за набор дней + расчёт ДРР."""
+    v = {
+        "revenue": round(P.sum_days(rec, day_keys, "revenue")),
+        "ordered_units": int(round(P.sum_days(rec, day_keys, "ordered_units"))),
+        "ad_spend": round(P.sum_days(rec, day_keys, "ad_spend")),
+        "hits_view": int(round(P.sum_days(rec, day_keys, "hits_view"))),
+    }
+    v["drr"] = _safe_div(v["ad_spend"], v["revenue"])
+    return v
+
+
+def _totals(rows):
+    t = {"revenue": 0, "ordered_units": 0, "ad_spend": 0, "hits_view": 0}
+    for _, v in rows:
+        for k in t:
+            t[k] += v.get(k, 0)
+    t["drr"] = _safe_div(t["ad_spend"], t["revenue"])
+    return t
+
+
+def _delta_rows(cur_rows, prev_rows):
+    """Разности по товарам: ДРР считается как разница долей (в п.п.), как в образце."""
+    cur = dict(cur_rows)
+    prev = dict(prev_rows)
+    out = []
+    for name in list(cur) + [n for n in prev if n not in cur]:
+        a, b = cur.get(name, {}), prev.get(name, {})
+        d = {k: (a.get(k, 0) - b.get(k, 0))
+             for k in ("revenue", "ordered_units", "ad_spend", "hits_view")}
+        d["drr"] = a.get("drr", 0) - b.get("drr", 0)
+        out.append((name, d))
+    return out
+
+
+def _align_blocks(cur_rows, prev_rows):
+    """
+    Приводит оба блока к ОДНОМУ набору товаров в АЛФАВИТНОМ порядке — как в
+    образце заказчика. Это принципиально: строки трёх блоков должны совпадать
+    построчно, иначе их нельзя сравнивать глазами. Товар, которого нет в одном
+    из периодов, добавляется с нулями.
+    """
+    empty = {"revenue": 0, "ordered_units": 0, "ad_spend": 0, "hits_view": 0, "drr": 0.0}
+    cur, prev = dict(cur_rows), dict(prev_rows)
+    names = sorted(set(cur) | set(prev), key=lambda s: str(s).lower())
+    return ([(n, cur.get(n, dict(empty))) for n in names],
+            [(n, prev.get(n, dict(empty))) for n in names])
+
+
+def _build_dod_like(collectors, cfg, cur_from, cur_to, prev_from, prev_to,
+                    lbl_cur, lbl_prev, lbl_delta, filename):
+    wb = _new_wb()
+    for colr in collectors:
+        cur_daily, _ = colr.daily_by_product(cur_from, cur_to, only_in_stock=True)
+        prev_daily, _ = colr.daily_by_product(prev_from, prev_to, only_in_stock=True)
+        cur_keys = [D.d(x) for x in _daterange(cur_from, cur_to)]
+        prev_keys = [D.d(x) for x in _daterange(prev_from, prev_to)]
+
+        cur_rows = [(r["name"] or r["offer_id"], _agg(r, cur_keys)) for r in cur_daily.values()]
+        prev_rows = [(r["name"] or r["offer_id"], _agg(r, prev_keys)) for r in prev_daily.values()]
+        cur_rows, prev_rows = _align_blocks(cur_rows, prev_rows)
+
+        ws = wb.create_sheet(X.safe_title(colr.name))
+        r = 1
+        r = _dod_block(ws, r, lbl_cur, cur_rows, _totals(cur_rows))
+        r = _dod_block(ws, r, lbl_prev, prev_rows, _totals(prev_rows))
+        deltas = _delta_rows(cur_rows, prev_rows)
+        dt = _totals(deltas)
+        dt["drr"] = _totals(cur_rows)["drr"] - _totals(prev_rows)["drr"]
+        _dod_block(ws, r, lbl_delta, deltas, dt)
+
+        X.set_widths(ws, [42, 12, 13, 12, 10, 12])
+        ws.freeze_panes = "B2"
+        X.page_setup(ws)
+
+    path = _out(cfg, filename)
+    wb.save(path)
+    log.info("отчёт готов: %s", path)
+    return path
+
+
+def build_day_over_day(collectors, cfg):
+    """Вчера к позавчера — макет образца «динамика день ко дню»."""
+    tz = cfg.TIMEZONE
+    y, dby = D.yesterday(tz), D.day_before_yesterday(tz)
+    return _build_dod_like(
+        collectors, cfg, y, y, dby, dby,
+        lbl_cur=y.strftime("%d.%m.%Y"),
+        lbl_prev=dby.strftime("%d.%m.%Y"),
+        lbl_delta=f"динамика {y.strftime('%d.%m.')} к {dby.strftime('%d.%m.')}",
+        filename=f"02_dinamika_den_ko_dnyu_{D.d(y)}.xlsx",
+    )
+
+
+def build_intraday(collectors, cfg, snapshots_dir=None):
+    """
+    Сегодня на время T к вчера на время T. Тот же макет, что отчёт 2.
+    Использует снимки: каждый запуск сохраняет срез накопленного за день,
+    сравнение идёт с вчерашним снимком того же часа.
+    """
+    snapshots_dir = snapshots_dir or getattr(cfg, "SNAPSHOTS_DIR", "snapshots")
+    tz = cfg.TIMEZONE
+    now = D.now_tz(tz)
+    hour, today, yday = now.hour, now.date(), D.yesterday(tz)
+    stamp = now.strftime("%Y-%m-%d_%H-%M")
+
+    wb = _new_wb()
+    for colr in collectors:
+        cur_daily, _ = colr.daily_by_product(today, today, only_in_stock=True)
+        cur_keys = [D.d(today)]
+        cur_rows = [(r["name"] or r["offer_id"], _agg(r, cur_keys)) for r in cur_daily.values()]
+
+        # снимок текущего слота — для сравнения завтра
+        S.save(snapshots_dir, colr.name, D.d(today), hour,
+               {n: v for n, v in cur_rows})
+
+        snap = S.load(snapshots_dir, colr.name, D.d(yday), hour)
+        if snap is not None:
+            prev_rows = [(n, v) for n, v in snap.items()]
+            note = ""
+        else:
+            prev_daily, _ = colr.daily_by_product(yday, yday, only_in_stock=True)
+            prev_rows = [(r["name"] or r["offer_id"], _agg(r, [D.d(yday)]))
+                         for r in prev_daily.values()]
+            note = " (снимка за вчера на этот час нет — сравнение с полным вчерашним днём)"
+        cur_rows, prev_rows = _align_blocks(cur_rows, prev_rows)
+
+        ws = wb.create_sheet(X.safe_title(colr.name))
+        r = 1
+        r = _dod_block(ws, r, f"сегодня {today.strftime('%d.%m.')} на {hour:02d}:00",
+                       cur_rows, _totals(cur_rows))
+        r = _dod_block(ws, r, f"вчера {yday.strftime('%d.%m.')} на {hour:02d}:00{note}",
+                       prev_rows, _totals(prev_rows))
+        deltas = _delta_rows(cur_rows, prev_rows)
+        dt = _totals(deltas)
+        dt["drr"] = _totals(cur_rows)["drr"] - _totals(prev_rows)["drr"]
+        _dod_block(ws, r, f"динамика на {hour:02d}:00", deltas, dt)
+
+        X.set_widths(ws, [42, 12, 13, 12, 10, 12])
+        ws.freeze_panes = "B2"
+        X.page_setup(ws)
+
+    path = _out(cfg, f"05_promezhutochnyy_{stamp}.xlsx")
+    wb.save(path)
+    log.info("отчёт 5 готов: %s", path)
+    return path
+
+
+# ============================================================ 3. Качественные
+
+# Строки и форматы строго по образцу «по аналитике»:
+# CTR — два знака (1,85%), % корзины и ДРР — один (20,5% / 14,7%),
+# место в поиске — целое число (62, 72, 54).
+QUALITY_ROWS = [
+    ("показы", "hits_view", X.FMT_PLAIN_INT),
+    ("клики", "session_view", X.FMT_PLAIN_INT),
+    ("CTR", "ctr", X.FMT_PCT2),
+    ("корзина", "hits_tocart", X.FMT_PLAIN_INT),
+    ("% корзины", "cart_rate", X.FMT_PCT),
+    ("купили (без отмен)", "bought", X.FMT_PLAIN_INT),
+    ("отмен", "cancellations", X.FMT_PLAIN_INT),
+    ("место в поиске", "position_category", X.FMT_PLAIN_INT),
+    ("оборот", "revenue", X.FMT_PLAIN_INT),
+    ("реклама", "ad_spend", X.FMT_PLAIN_INT),
+    ("ДРР %", "drr", X.FMT_PCT),
+]
+
+
+def _quality_day_values(d):
+    """Расчёт производных показателей за один день по образцу."""
+    views = d.get("hits_view", 0) or 0
+    clicks = d.get("session_view", 0) or 0
+    cart = d.get("hits_tocart", 0) or 0
+    ordered = d.get("ordered_units", 0) or 0
+    cancel = d.get("cancellations", 0) or 0
+    revenue = d.get("revenue", 0) or 0
+    spend = d.get("ad_spend", 0) or 0
+    return {
+        "hits_view": int(round(views)),
+        "session_view": int(round(clicks)),
+        "ctr": _safe_div(clicks, views),
+        "hits_tocart": int(round(cart)),
+        "cart_rate": _safe_div(cart, clicks),
+        "bought": int(round(max(ordered - cancel, 0))),
+        "cancellations": int(round(cancel)),
+        "position_category": int(round(d.get("position_category", 0) or 0)),
+        "revenue": round(revenue),
+        "ad_spend": round(spend),
+        "drr": _safe_div(spend, revenue),
+    }
+
+
+def _quality_write_block(ws, r, title, days, vals_by_day, day_keys, with_total):
+    """Один блок «метрики строками, дни колонками». Возвращает следующую строку."""
+    c = ws.cell(r, 1, value=title)
+    X.style_header_cell(c, yellow=True)
+    for i, dt in enumerate(days):
+        c = ws.cell(r, 2 + i, value=dt)
+        X.style_header_cell(c)
+        c.number_format = X.FMT_DATE
+    if with_total:
+        X.style_header_cell(ws.cell(r, 2 + len(days), value="Итого"))
+
+    for label, key, fmt in QUALITY_ROWS:
+        r += 1
+        cc = ws.cell(r, 1, value=label)
+        X.style_body_cell(cc)
+        cc.alignment = X.LEFT
+        for i, k in enumerate(day_keys):
+            X.style_body_cell(ws.cell(r, 2 + i, value=vals_by_day[k][key]), fmt)
+        if with_total:
+            X.style_body_cell(
+                ws.cell(r, 2 + len(days),
+                        value=_quality_row_total(key, vals_by_day, day_keys)),
+                fmt, bold=True)
+        # шкала по строке — как в образце, каждая метрика красится по своему ряду
+        X.color_scale(ws, f"{X.col(2)}{r}:{X.col(1 + len(days))}{r}")
+    return r + 2
+
+
+def _quality_store_totals(items, day_keys):
+    """
+    Свод по магазину на каждый день — блок «по аналитике».
+    Аддитивные метрики складываются, «место в поиске» усредняется по товарам
+    (складывать позиции в поиске бессмысленно — получилась бы сумма мест).
+    """
+    ADDITIVE = ("revenue", "ordered_units", "cancellations", "hits_view",
+                "session_view", "hits_tocart", "ad_spend")
+    out = {}
+    for k in day_keys:
+        acc = {m: 0 for m in ADDITIVE}
+        positions = []
+        for rec in items:
+            day = rec["days"].get(k) or {}
+            for m in ADDITIVE:
+                acc[m] += (day.get(m, 0) or 0)
+            pos = day.get("position_category") or 0
+            if pos:
+                positions.append(pos)
+        acc["position_category"] = (sum(positions) / len(positions)) if positions else 0
+        out[k] = _quality_day_values(acc)
+    return out
+
+
+def build_quality(collectors, cfg):
+    """
+    Лист на магазин. Первый блок — свод «по аналитике» (как на образце),
+    далее блок на каждый товар. Только товары на остатках, без OUT.
+    """
+    tz = cfg.TIMEZONE
+    date_from, date_to = _period(cfg)
+    days = _daterange(date_from, date_to)
+    day_keys = [D.d(x) for x in days]
+    stamp = D.now_tz(tz).strftime("%Y-%m-%d")
+    with_total = bool(getattr(cfg, "QUALITY_TOTAL_COLUMN", False))
+
+    wb = _new_wb()
+    for colr in collectors:
+        daily, _ = colr.daily_by_product(date_from, date_to, only_in_stock=True)
+        items = sorted(
+            daily.values(),
+            key=lambda rec: P.sum_days(rec, day_keys, "revenue"),
+            reverse=True,
+        )
+
+        ws = wb.create_sheet(X.safe_title(colr.name))
+        r = 1
+
+        # --- сводный блок по магазину ---
+        if items:
+            r = _quality_write_block(ws, r, "по аналитике", days,
+                                     _quality_store_totals(items, day_keys),
+                                     day_keys, with_total)
+
+        # --- блок на каждый товар ---
+        for rec in items:
+            vals_by_day = {k: _quality_day_values(rec["days"].get(k, {})) for k in day_keys}
+            if not any(v["hits_view"] or v["revenue"] for v in vals_by_day.values()):
+                continue
+            r = _quality_write_block(ws, r, rec["name"] or rec["offer_id"], days,
+                                     vals_by_day, day_keys, with_total)
+
+        X.set_widths(ws, [24] + [11] * len(days) + ([12] if with_total else []))
+        ws.freeze_panes = "B1"
+        X.page_setup(ws)
+
+    path = _out(cfg, f"03_kachestvennye_pokazateli_{stamp}.xlsx")
+    wb.save(path)
+    log.info("отчёт 3 готов: %s", path)
+    return path
+
+
+def _quality_row_total(key, vals_by_day, day_keys):
+    """Итог строки: аддитивные метрики суммируем, доли/позицию пересчитываем."""
+    vals = [vals_by_day[k] for k in day_keys]
+    if key in ("hits_view", "session_view", "hits_tocart", "bought",
+               "cancellations", "revenue", "ad_spend"):
+        return round(sum(v[key] for v in vals))
+    if key == "ctr":
+        return _safe_div(sum(v["session_view"] for v in vals), sum(v["hits_view"] for v in vals))
+    if key == "cart_rate":
+        return _safe_div(sum(v["hits_tocart"] for v in vals), sum(v["session_view"] for v in vals))
+    if key == "drr":
+        return _safe_div(sum(v["ad_spend"] for v in vals), sum(v["revenue"] for v in vals))
+    if key == "position_category":
+        nz = [v[key] for v in vals if v[key]]
+        return round(sum(nz) / len(nz), 1) if nz else 0
+    return 0
+
+
+# ============================================================ 4. Остатки по кластерам
+
+STOCK_HEADERS = [
+    "Артикул", "Кластер", "Доступно к продаже", "В заявках на поставку",
+    "В поставках в пути", "Итог", "прод 7д", "среднее", "потреб 30д",
+    "потреб 45д", "на сколько дней хватит остатков",
+]
+
+
+def build_stocks(collectors, cfg):
+    """
+    Артикул × кластер с прогнозом обеспеченности. Формулы — как в образце:
+      Итог      = Доступно + В заявках + В пути
+      среднее   = прод 7д / 7
+      потреб 30д = среднее*30 - Итог
+      потреб 45д = среднее*45 - Итог
+      хватит дней = Итог / среднее
+    """
+    tz = cfg.TIMEZONE
+    stamp = D.now_tz(tz).strftime("%Y-%m-%d")
+    date_to = D.yesterday(tz)
+    date_from = date_to - timedelta(days=6)   # прод 7д
+
+    wb = _new_wb()
+    for colr in collectors:
+        rows = colr.cluster_stocks()
+
+        # продажи за 7 дней по артикулу (для распределения по кластерам,
+        # если OZON не отдал среднесуточные продажи ads по кластеру)
+        sales7 = {}
+        try:
+            prods = colr.products_for_period(date_from, date_to, only_in_stock=True,
+                                             with_kpi=False)
+            for rec in prods.values():
+                sales7[rec["offer_id"]] = int(round(rec.get("ordered_units", 0) or 0))
+        except Exception as e:
+            log.warning("[%s] продажи за 7 дней недоступны: %s", colr.name, e)
+
+        ws = wb.create_sheet(X.safe_title(colr.name))
+        # Шапка как в образце: A–E — серо-голубая шапка выгрузки OZON,
+        # F «Итог» — без заливки, G–K (расчётные) — жёлтые с красным текстом.
+        for i, h in enumerate(STOCK_HEADERS, start=1):
+            cell = ws.cell(1, i, value=h)
+            if i <= 5:
+                X.style_header_cell(cell, ozon=True)
+            elif i == 6:
+                cell.border = X.BORDER
+                cell.alignment = X.CENTER
+            else:
+                X.style_header_cell(cell, yellow=True)
+
+        # группируем по артикулу
+        by_offer = {}
+        for rr in rows:
+            by_offer.setdefault(rr["offer_id"], []).append(rr)
+
+        # считаем «прод 7д» заранее, чтобы отсортировать кластеры по нему
+        prepared = []
+        for offer_id, crows in by_offer.items():
+            has_ads = any(rr.get("ads") for rr in crows)
+            total_stock = sum(rr["available"] + rr["requested"] + rr["transit"]
+                              for rr in crows) or 1
+            block = []
+            for rr in crows:
+                if has_ads:
+                    sold7 = int(round((rr.get("ads") or 0) * 7))
+                else:
+                    share = (rr["available"] + rr["requested"] + rr["transit"]) / total_stock
+                    sold7 = int(round(sales7.get(offer_id, 0) * share))
+                block.append((rr, sold7))
+            # внутри артикула кластеры по убыванию продаж — как в образце
+            block.sort(key=lambda t: t[1], reverse=True)
+            prepared.append((offer_id, sum(s for _, s in block), block))
+        prepared.sort(key=lambda t: t[1], reverse=True)
+
+        r = 1
+        for offer_id, _, block in prepared:
+            for rr, sold7 in block:
+                r += 1
+                name = rr.get("name") or offer_id
+                X.style_body_cell(ws.cell(r, 1, value=name))
+                ws.cell(r, 1).alignment = X.LEFT
+                X.style_body_cell(ws.cell(r, 2, value=rr.get("cluster", "")))
+                ws.cell(r, 2).alignment = X.LEFT
+                X.style_body_cell(ws.cell(r, 3, value=rr["available"]), X.FMT_PLAIN_INT)
+                X.style_body_cell(ws.cell(r, 4, value=rr["requested"]), X.FMT_PLAIN_INT)
+                X.style_body_cell(ws.cell(r, 5, value=rr["transit"]), X.FMT_PLAIN_INT)
+
+                # формулы 1-в-1 с образцом
+                cc = ws.cell(r, 6, value=f"=C{r}+D{r}+E{r}")
+                X.style_body_cell(cc); cc.number_format = X.FMT_PLAIN_INT
+                X.style_body_cell(ws.cell(r, 7, value=sold7), X.FMT_PLAIN_INT)
+                cc = ws.cell(r, 8, value=f"=G{r}/7")
+                X.style_body_cell(cc); cc.number_format = X.FMT_FLOAT1
+                cc = ws.cell(r, 9, value=f"=H{r}*30-F{r}")
+                X.style_body_cell(cc); cc.number_format = X.FMT_PLAIN_INT
+                cc = ws.cell(r, 10, value=f"=H{r}*45-F{r}")
+                X.style_body_cell(cc); cc.number_format = X.FMT_PLAIN_INT
+                cc = ws.cell(r, 11, value=f'=IF(H{r}=0,"",F{r}/H{r})')
+                X.style_body_cell(cc); cc.number_format = X.FMT_FLOAT1
+
+        if r > 1:
+            # правила подсветки строго как в образце
+            X.highlight_zero(ws, f"C2:E{r}")          # нет остатка — розовым
+            X.highlight_zero(ws, f"F2:F{r}")          # нулевой итог — розовым
+            X.highlight_negative_good(ws, f"I2:J{r}")  # потребность закрыта — зелёным
+            X.color_scale(ws, f"G2:G{r}")             # прод 7д
+            X.color_scale(ws, f"H2:H{r}")             # среднее
+            X.color_scale(ws, f"K2:K{r}")             # на сколько дней хватит
+
+        X.set_widths(ws, [46.25, 30.6, 14.9, 14.9, 14.9, 9, 10, 10, 11, 11, 14.9])
+        ws.freeze_panes = "C2"
+        X.page_setup(ws)
+
+    path = _out(cfg, f"04_ostatki_po_pozitsiyam_{stamp}.xlsx")
+    wb.save(path)
+    log.info("отчёт 4 готов: %s", path)
+    return path
