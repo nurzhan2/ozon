@@ -1,0 +1,29 @@
+# СЕКРЕТЫ — никогда не коммитить
+local_config.py
+config.example.py
+google_service_account.json
+*.pem
+.env
+samples/
+
+# данные и результаты
+output/
+snapshots/
+logs/
+examples/
+data/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# служебное
+.DS_Store
+*.pdf
+*.png
+snapshots_test/
+test_output/
