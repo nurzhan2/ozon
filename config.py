@@ -114,21 +114,43 @@ def _resolve_credentials():
     Ключ сервисного аккаунта можно задать двумя способами: положить файл рядом
     с проектом или передать его содержимое переменной GOOGLE_CREDENTIALS_JSON
     (так удобнее на Railway). Во втором случае пишем во временный файл.
+
+    Важно: проблемы с Google НЕ должны ронять сервис. Если ключа нет или он
+    битый (например, в переменной остался шаблон из .env.example), сервис
+    только предупреждает и отключает выгрузку — отчёты всё равно соберутся
+    в файлы, а причина будет видна в логе.
     """
+    global UPLOAD_TO_GOOGLE
+
     path = os.environ.get("GOOGLE_CREDENTIALS_FILE", "google_service_account.json")
     raw = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
-    if raw and not os.path.exists(path):
-        target = os.path.join(DATA_DIR if os.path.isdir(DATA_DIR) else ".",
-                              "google_service_account.json")
-        try:
-            json.loads(raw)          # проверяем, что это валидный JSON
-        except json.JSONDecodeError as e:
-            raise SystemExit(f"GOOGLE_CREDENTIALS_JSON — некорректный JSON: {e}")
+
+    if not UPLOAD_TO_GOOGLE:
+        return path                      # выгрузка выключена — ключ не нужен
+    if not raw or os.path.exists(path):
+        return path
+
+    try:
+        json.loads(raw)                  # проверяем, что это валидный JSON
+    except json.JSONDecodeError as e:
+        print(f"[config] GOOGLE_CREDENTIALS_JSON не разобран как JSON ({e}). "
+              f"Похоже, в переменной остался шаблон из .env.example. "
+              f"Выгрузка в Google отключена, отчёты будут собираться в файлы.")
+        UPLOAD_TO_GOOGLE = False
+        return path
+
+    target = os.path.join(DATA_DIR if os.path.isdir(DATA_DIR) else ".",
+                          "google_service_account.json")
+    try:
         with open(target, "w", encoding="utf-8") as f:
             f.write(raw)
         os.chmod(target, 0o600)
-        return target
-    return path
+    except OSError as e:
+        print(f"[config] Не удалось сохранить ключ Google ({e}). "
+              f"Выгрузка отключена, отчёты будут собираться в файлы.")
+        UPLOAD_TO_GOOGLE = False
+        return path
+    return target
 
 
 GOOGLE_CREDENTIALS_FILE = _resolve_credentials()
