@@ -12,8 +12,11 @@
 в константы вверху методов).
 """
 
+import os
 import time
 import logging
+import threading
+
 import requests
 
 log = logging.getLogger("ozon.seller")
@@ -58,6 +61,28 @@ METRICS_REPORT = [
 METRICS_PER_REQUEST = 14
 
 
+# ----------------------------------------------------------------------------
+# Ограничитель скорости.
+# OZON держит жёсткий лимит Seller API: 2 запроса в секунду на клиента
+# ("rate limit exceeded for `seller-api` client, current max rate per sec.: 2").
+# Лимит общий на процесс, поэтому ограничитель — на уровне модуля, а не
+# экземпляра: иначе пять магазинов подряд легко выбивают 429.
+# ----------------------------------------------------------------------------
+_RATE_LOCK = threading.Lock()
+_LAST_CALL = [0.0]
+MIN_INTERVAL = float(os.environ.get("OZON_MIN_INTERVAL", "0.6"))   # сек между запросами
+
+
+def _throttle():
+    """Выдерживает паузу так, чтобы не превышать разрешённую частоту."""
+    with _RATE_LOCK:
+        now = time.monotonic()
+        wait = MIN_INTERVAL - (now - _LAST_CALL[0])
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_CALL[0] = time.monotonic()
+
+
 class SellerAPIError(Exception):
     """Ошибка Seller API. network=True — до OZON не достучались (сеть/прокси)."""
 
@@ -87,6 +112,7 @@ class SellerAPI:
         last_err = None
         network_only = True   # ни одного ответа от OZON так и не получили
         for attempt in range(1, self.max_retries + 1):
+            _throttle()
             try:
                 r = self.session.post(url, json=payload, timeout=self.timeout)
             except requests.RequestException as e:
@@ -103,7 +129,8 @@ class SellerAPI:
 
             # 429 / 5xx — повторяем с паузой
             if r.status_code in (429, 500, 502, 503, 504):
-                wait = min(2 ** attempt, 30)
+                # 429 — упёрлись в лимит частоты: ждём заметно дольше
+                wait = min(5 * attempt, 30) if r.status_code == 429 else min(2 ** attempt, 30)
                 log.warning("[%s] %s HTTP %d, пауза %ds (попытка %d/%d)",
                             self.name, path, r.status_code, wait, attempt, self.max_retries)
                 last_err = SellerAPIError(f"HTTP {r.status_code}: {r.text[:300]}",
@@ -177,7 +204,6 @@ class SellerAPI:
                 if len(rows) < limit:
                     break
                 offset += limit
-                time.sleep(0.3)  # бережём лимиты
         # приводим к списку
         result = []
         for rec in merged.values():
@@ -200,7 +226,6 @@ class SellerAPI:
             last_id = res.get("last_id") or ""
             if not batch or not last_id or len(batch) < limit:
                 break
-            time.sleep(0.2)
         return items
 
     def product_info_list(self, product_ids):
@@ -236,7 +261,6 @@ class SellerAPI:
                         skus.add(int(v))
                 for s in skus:
                     sku_map[s] = {"offer_id": offer_id, "name": name, "product_id": pid}
-            time.sleep(0.2)
         return sku_map, offer_map
 
     # ---------------- Остатки ----------------
@@ -267,14 +291,12 @@ class SellerAPI:
             last_id = res.get("last_id") or ""
             if not items or not last_id or len(items) < limit:
                 break
-            time.sleep(0.2)
         return result
 
     # ---------------- Остатки по кластерам ----------------
     def cluster_stocks(self, limit=1000):
         """
-        POST /v1/analytics/manage/stocks — остатки в разрезе КЛАСТЕРОВ.
-        Именно этот метод даёт колонки образца:
+        Остатки в разрезе КЛАСТЕРОВ — дают колонки образца:
           «Доступно к продаже», «В заявках на поставку», «В поставках в пути».
 
         Возвращает список строк:
@@ -284,11 +306,27 @@ class SellerAPI:
         Если метод недоступен на аккаунте — поднимает SellerAPIError,
         вызывающий код перейдёт на запасной вариант (склады вместо кластеров).
         """
+        # OZON менял путь этого метода; пробуем известные варианты по очереди.
+        # Если ни один не отвечает — вызывающий код откатится на склады.
+        paths = ["/v1/analytics/manage/stocks", "/v1/analytics/stocks"]
+        path = None
+        last = None
+        for p in paths:
+            try:
+                self._post(p, {"limit": 1, "offset": 0, "filter": {}})
+                path = p
+                break
+            except SellerAPIError as e:
+                last = e
+                continue
+        if path is None:
+            raise last or SellerAPIError(f"[{self.name}] кластерные остатки недоступны")
+
         rows = []
         offset = 0
         while True:
             payload = {"limit": limit, "offset": offset, "filter": {}}
-            data = self._post("/v1/analytics/manage/stocks", payload)
+            data = self._post(path, payload)
             items = data.get("items") or (data.get("result") or {}).get("items") or []
             for it in items:
                 rows.append({
@@ -306,7 +344,6 @@ class SellerAPI:
             if len(items) < limit:
                 break
             offset += limit
-            time.sleep(0.3)
         return rows
 
     # ---------------- Остатки по складам (запасной вариант) ----------------
@@ -337,7 +374,6 @@ class SellerAPI:
             if len(items) < limit:
                 break
             offset += limit
-            time.sleep(0.3)
         return rows
 
 
