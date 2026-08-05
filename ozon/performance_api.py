@@ -16,6 +16,7 @@
 """
 
 import io
+import os
 import csv
 import time
 import logging
@@ -24,6 +25,16 @@ import requests
 log = logging.getLogger("ozon.perf")
 
 BASE_URL = "https://api-performance.ozon.ru"
+
+# OZON принимает не больше 10 кампаний в одном запросе статистики
+# ("Превышен лимит по количеству кампаний (максимум 10)").
+MAX_CAMPAIGNS_PER_REQUEST = 10
+
+# Верхняя граница на число кампаний в одном отчёте. Статистика асинхронная
+# (запрос -> ожидание -> CSV), поэтому 289 кампаний = 29 отчётов и десятки
+# минут ожидания. Ограничение делает сбор предсказуемым по времени; сколько
+# кампаний отброшено, всегда пишется в лог — тихих усечений быть не должно.
+MAX_CAMPAIGNS_TOTAL = int(os.environ.get("PERF_MAX_CAMPAIGNS", "60"))
 
 
 def _num(x):
@@ -99,10 +110,23 @@ class PerformanceAPI:
             raise PerformanceAPIError(f"[{self.name}] POST {path} HTTP {r.status_code}: {r.text[:300]}")
         return r.json()
 
-    def campaigns(self):
-        """GET /api/client/campaign -> список кампаний."""
+    def campaigns(self, only_active=True):
+        """
+        GET /api/client/campaign -> список кампаний.
+        Сначала идут активные: если кампаний больше лимита, в отчёт попадут
+        именно работающие, а не архивные.
+        """
         data = self._get("/api/client/campaign").json()
-        return data.get("list") or data.get("campaigns") or []
+        items = data.get("list") or data.get("campaigns") or []
+        if not only_active:
+            return items
+
+        def is_active(c):
+            state = str(c.get("state") or c.get("status") or "").upper()
+            return "RUNNING" in state or "ACTIVE" in state
+
+        active = [c for c in items if is_active(c)]
+        return active or items          # если статусы не распознались — берём все
 
     def statistics(self, date_from, date_to, campaign_ids=None, group_by="DATE"):
         """
@@ -115,6 +139,24 @@ class PerformanceAPI:
             campaign_ids = [str(c.get("id")) for c in self.campaigns() if c.get("id")]
         if not campaign_ids:
             return []
+
+        if len(campaign_ids) > MAX_CAMPAIGNS_TOTAL:
+            log.warning("[%s] кампаний %d, в отчёт войдут первые %d "
+                        "(ограничение PERF_MAX_CAMPAIGNS) — остальные пропущены",
+                        self.name, len(campaign_ids), MAX_CAMPAIGNS_TOTAL)
+            campaign_ids = campaign_ids[:MAX_CAMPAIGNS_TOTAL]
+
+        # OZON не принимает больше 10 кампаний за раз — идём пачками
+        if len(campaign_ids) > MAX_CAMPAIGNS_PER_REQUEST:
+            rows = []
+            for i in range(0, len(campaign_ids), MAX_CAMPAIGNS_PER_REQUEST):
+                chunk = campaign_ids[i:i + MAX_CAMPAIGNS_PER_REQUEST]
+                try:
+                    rows.extend(self.statistics(date_from, date_to, chunk, group_by))
+                except PerformanceAPIError as e:
+                    log.warning("[%s] пачка кампаний %d-%d пропущена: %s",
+                                self.name, i + 1, i + len(chunk), e)
+            return rows
 
         payload = {
             "campaigns": [str(c) for c in campaign_ids],
