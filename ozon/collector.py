@@ -85,9 +85,14 @@ class StoreCollector:
         Пробует кластерный метод, при недоступности откатывается на склады.
         """
         if self._cluster_rows is None:
+            # Кластерному методу нужен список sku магазина: он принимает их
+            # пачками до 100, а не limit/offset. Справочник уже загружен.
+            sku_map, _ = self.maps()
             try:
-                log.info("[%s] загрузка остатков по кластерам...", self.name)
-                rows = self.seller.cluster_stocks()
+                log.info("[%s] загрузка остатков по кластерам (sku: %d)...",
+                         self.name, len(sku_map))
+                rows = self.seller.cluster_stocks(skus=list(sku_map))
+                log.info("[%s] кластерных строк: %d", self.name, len(rows))
             except SellerAPIError as e:
                 log.warning("[%s] кластерный метод недоступен (%s), беру склады", self.name, e)
                 rows = self.seller.stocks_on_warehouses()

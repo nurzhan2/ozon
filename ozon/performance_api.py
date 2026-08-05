@@ -332,13 +332,23 @@ class PerformanceAPI:
         """
         if self._usage.get("own_limit") or not BLOCK_RETRY_HOURS:
             return False
+        if self._probed_at and (time.time() - self._probed_at) < BLOCK_RETRY_HOURS * 3600:
+            return False
+
         at = float(self._usage.get("blocked_at") or 0)
         if not at:
-            return False
+            # Отметки времени нет: либо файл счётчика писала прошлая версия,
+            # либо его правили руками. Ждать в такой ситуации нечего — иначе
+            # магазин остаётся выключенным навсегда, что и случилось
+            # с «Секретами красоты». Пробуем сразу.
+            self._probed_at = time.time()
+            self._probe_allowed = True
+            log.info("[%s] блокировка без отметки времени — пробую один запрос",
+                     self.name)
+            return True
+
         waited = time.time() - at
         if waited < BLOCK_RETRY_HOURS * 3600:
-            return False
-        if self._probed_at and (time.time() - self._probed_at) < BLOCK_RETRY_HOURS * 3600:
             return False
         self._probed_at = time.time()
         self._probe_allowed = True

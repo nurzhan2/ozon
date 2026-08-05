@@ -240,6 +240,18 @@ check("свой потолок не пробуется даже через 10 ч
       api5.session.n)
 PA2.DAILY_BUDGET = 1500
 
+# --------------------------- 7. блокировка из файла старого формата
+print("\n7. Блокировка, записанная прошлой версией (без отметки времени)")
+import json as _json
+legacy = os.path.join(CACHE, "perf_usage_cid8.json")
+_json.dump({"date": PA2._msk_date(), "count": 7, "blocked": True},
+           open(legacy, "w", encoding="utf-8"))
+api = PA2.PerformanceAPI("cid8", "s", name="ТЕСТ")
+api.session = FakeSession(campaigns=camps(spec2[:10]))
+rows = api.statistics("2026-08-01", "2026-08-01")
+check("магазин не заперт навсегда — пробуем и собираем", len(rows) == 10, len(rows))
+check("блокировка снята", api._usage.get("blocked") is False, api._usage)
+
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 shutil.rmtree(CACHE, ignore_errors=True)
 sys.exit(0 if ok else 1)

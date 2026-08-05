@@ -294,7 +294,43 @@ class SellerAPI:
         return result
 
     # ---------------- Остатки по кластерам ----------------
-    def cluster_stocks(self, limit=1000):
+    # /v1/analytics/stocks принимает СПИСОК SKU, а не limit/offset, и требует
+    # от 1 до 100 штук за раз. Проба пустым фильтром отбивалась с 400
+    # «invalid AnalyticsStocksRequest.Skus: value must contain between 1 and
+    # 100 items», метод считался недоступным у всех пяти магазинов, и отчёт 4
+    # молча собирался по складам. А по складам нет ни «в пути», ни
+    # среднесуточных продаж OZON — две колонки образца оставались нулями.
+    STOCKS_SKU_CHUNK = 100
+
+    @staticmethod
+    def _cluster_row(it):
+        return {
+            "offer_id": it.get("offer_id", ""),
+            "sku": it.get("sku"),
+            "name": it.get("name", "") or it.get("title", ""),
+            "cluster": it.get("cluster_name") or it.get("cluster") or "",
+            "warehouse": it.get("warehouse_name", ""),
+            "available": _i(it.get("available_stock_count") or it.get("valid_stock_count")),
+            "requested": _i(it.get("requested_stock_count")),
+            "transit": _i(it.get("transit_stock_count")),
+            "ads": _f(it.get("ads")),
+            "idc": _f(it.get("idc")),
+        }
+
+    def _cluster_stocks_by_sku(self, skus):
+        """/v1/analytics/stocks — пачками не больше 100 sku за запрос."""
+        uniq = list(dict.fromkeys(str(x) for x in skus if x))
+        if not uniq:
+            raise SellerAPIError(f"[{self.name}] нет sku для кластерных остатков")
+        rows = []
+        for i in range(0, len(uniq), self.STOCKS_SKU_CHUNK):
+            chunk = uniq[i:i + self.STOCKS_SKU_CHUNK]
+            data = self._post("/v1/analytics/stocks", {"skus": chunk})
+            items = data.get("items") or (data.get("result") or {}).get("items") or []
+            rows.extend(self._cluster_row(it) for it in items)
+        return rows
+
+    def cluster_stocks(self, skus=None, limit=1000):
         """
         Остатки в разрезе КЛАСТЕРОВ — дают колонки образца:
           «Доступно к продаже», «В заявках на поставку», «В поставках в пути».
@@ -303,44 +339,36 @@ class SellerAPI:
           {"offer_id","name","cluster","available","requested","transit",
            "ads" (среднесуточные продажи по данным OZON), "idc" (дней хватит)}
 
-        Если метод недоступен на аккаунте — поднимает SellerAPIError,
-        вызывающий код перейдёт на запасной вариант (склады вместо кластеров).
+        skus — список sku магазина. Без него остаётся только старый путь
+        с пагинацией. Если не отвечает ни один — поднимает SellerAPIError,
+        и вызывающий код откатится на склады.
         """
-        # OZON менял путь этого метода; пробуем известные варианты по очереди.
-        # Если ни один не отвечает — вызывающий код откатится на склады.
-        paths = ["/v1/analytics/manage/stocks", "/v1/analytics/stocks"]
-        path = None
-        last = None
-        for p in paths:
+        errors = []
+        if skus:
             try:
-                self._post(p, {"limit": 1, "offset": 0, "filter": {}})
-                path = p
-                break
+                return self._cluster_stocks_by_sku(skus)
             except SellerAPIError as e:
-                last = e
-                continue
-        if path is None:
-            raise last or SellerAPIError(f"[{self.name}] кластерные остатки недоступны")
+                errors.append(str(e))
+                log.debug("[%s] /v1/analytics/stocks не отдал кластеры: %s",
+                          self.name, e)
+
+        # Старый путь: OZON менял адрес метода, у части аккаунтов работает
+        # вариант с limit/offset.
+        try:
+            self._post("/v1/analytics/manage/stocks",
+                       {"limit": 1, "offset": 0, "filter": {}})
+        except SellerAPIError as e:
+            errors.append(str(e))
+            raise SellerAPIError(f"[{self.name}] кластерные остатки недоступны: "
+                                 + "; ".join(errors[-2:]))
 
         rows = []
         offset = 0
         while True:
             payload = {"limit": limit, "offset": offset, "filter": {}}
-            data = self._post(path, payload)
+            data = self._post("/v1/analytics/manage/stocks", payload)
             items = data.get("items") or (data.get("result") or {}).get("items") or []
-            for it in items:
-                rows.append({
-                    "offer_id": it.get("offer_id", ""),
-                    "sku": it.get("sku"),
-                    "name": it.get("name", "") or it.get("title", ""),
-                    "cluster": it.get("cluster_name") or it.get("cluster") or "",
-                    "warehouse": it.get("warehouse_name", ""),
-                    "available": _i(it.get("available_stock_count") or it.get("valid_stock_count")),
-                    "requested": _i(it.get("requested_stock_count")),
-                    "transit": _i(it.get("transit_stock_count")),
-                    "ads": _f(it.get("ads")),
-                    "idc": _f(it.get("idc")),
-                })
+            rows.extend(self._cluster_row(it) for it in items)
             if len(items) < limit:
                 break
             offset += limit
