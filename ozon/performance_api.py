@@ -20,6 +20,9 @@ import os
 import csv
 import time
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 
 log = logging.getLogger("ozon.perf")
@@ -30,11 +33,23 @@ BASE_URL = "https://api-performance.ozon.ru"
 # ("Превышен лимит по количеству кампаний (максимум 10)").
 MAX_CAMPAIGNS_PER_REQUEST = 10
 
-# Верхняя граница на число кампаний в одном отчёте. Статистика асинхронная
-# (запрос -> ожидание -> CSV), поэтому 289 кампаний = 29 отчётов и десятки
-# минут ожидания. Ограничение делает сбор предсказуемым по времени; сколько
-# кампаний отброшено, всегда пишется в лог — тихих усечений быть не должно.
-MAX_CAMPAIGNS_TOTAL = int(os.environ.get("PERF_MAX_CAMPAIGNS", "60"))
+# Верхняя граница на число кампаний в отчёте. 0 — без ограничения, берутся ВСЕ.
+# По умолчанию именно 0: усечение молча искажает «рекламу» и «ДРР», а это те
+# самые колонки, ради которых отчёт и собирается. Переменная оставлена как
+# аварийный тормоз, если у магазина окажутся сотни кампаний и сбор перестанет
+# укладываться в окно до 8 утра.
+MAX_CAMPAIGNS_TOTAL = int(os.environ.get("PERF_MAX_CAMPAIGNS", "0"))
+
+# Пачки по 10 кампаний идут параллельно: статистика асинхронная (запрос ->
+# ожидание -> скачивание CSV), и почти всё время нить просто спит в ожидании
+# готовности отчёта. При 289 кампаниях это 29 отчётов: последовательно —
+# десятки минут, в 4 потока — минуты. Лимит Seller API (2 запроса в секунду)
+# сюда не относится: это отдельный сервис.
+PARALLEL_BATCHES = max(1, int(os.environ.get("PERF_PARALLEL", "4")))
+
+# Сколько ждать готовности одного отчёта и как часто спрашивать статус.
+REPORT_TIMEOUT = float(os.environ.get("PERF_REPORT_TIMEOUT", "300"))
+POLL_INTERVAL = float(os.environ.get("PERF_POLL_INTERVAL", "3"))
 
 
 def _num(x):
@@ -73,8 +88,17 @@ class PerformanceAPI:
         self.session = requests.Session()
         self._token = None
         self._token_exp = 0
+        # Пачки кампаний идут в несколько потоков через одну сессию. Обновление
+        # токена пишет и в self._token, и в общие заголовки сессии, поэтому
+        # обёрнуто замком: иначе два потока разом полезут за токеном и один
+        # затрёт заголовок другого на полуслове.
+        self._auth_lock = threading.Lock()
 
     def _auth(self):
+        with self._auth_lock:
+            self._auth_locked()
+
+    def _auth_locked(self):
         if self._token and time.time() < self._token_exp - 60:
             return
         r = self.session.post(
@@ -96,19 +120,34 @@ class PerformanceAPI:
         self._token_exp = time.time() + int(data.get("expires_in", 1800))
         self.session.headers.update({"Authorization": f"Bearer {self._token}"})
 
+    # Пачки идут параллельно, поэтому OZON может ответить 429 или временной
+    # 5xx. Такие ответы повторяются с нарастающей паузой: терять из-за них
+    # целую пачку кампаний (а с ней часть расхода на рекламу) незачем.
+    RETRY_CODES = (429, 500, 502, 503, 504)
+    RETRIES = 4
+
+    def _request(self, method, path, ok_codes, **kw):
+        last = None
+        for attempt in range(1, self.RETRIES + 1):
+            self._auth()
+            r = self.session.request(method, BASE_URL + path,
+                                     timeout=self.timeout, **kw)
+            if r.status_code in ok_codes:
+                return r
+            last = f"HTTP {r.status_code}: {r.text[:300]}"
+            if r.status_code not in self.RETRY_CODES or attempt == self.RETRIES:
+                break
+            pause = min(3 * attempt, 15)
+            log.debug("[%s] %s %s -> %d, повтор через %.0f с",
+                      self.name, method, path, r.status_code, pause)
+            time.sleep(pause)
+        raise PerformanceAPIError(f"[{self.name}] {method} {path} {last}")
+
     def _get(self, path, **kw):
-        self._auth()
-        r = self.session.get(BASE_URL + path, timeout=self.timeout, **kw)
-        if r.status_code != 200:
-            raise PerformanceAPIError(f"[{self.name}] GET {path} HTTP {r.status_code}: {r.text[:300]}")
-        return r
+        return self._request("GET", path, (200,), **kw)
 
     def _post(self, path, payload):
-        self._auth()
-        r = self.session.post(BASE_URL + path, json=payload, timeout=self.timeout)
-        if r.status_code not in (200, 202):
-            raise PerformanceAPIError(f"[{self.name}] POST {path} HTTP {r.status_code}: {r.text[:300]}")
-        return r.json()
+        return self._request("POST", path, (200, 202), json=payload).json()
 
     def campaigns(self, only_active=True):
         """
@@ -140,24 +179,50 @@ class PerformanceAPI:
         if not campaign_ids:
             return []
 
-        if len(campaign_ids) > MAX_CAMPAIGNS_TOTAL:
+        if MAX_CAMPAIGNS_TOTAL and len(campaign_ids) > MAX_CAMPAIGNS_TOTAL:
             log.warning("[%s] кампаний %d, в отчёт войдут первые %d "
                         "(ограничение PERF_MAX_CAMPAIGNS) — остальные пропущены",
                         self.name, len(campaign_ids), MAX_CAMPAIGNS_TOTAL)
             campaign_ids = campaign_ids[:MAX_CAMPAIGNS_TOTAL]
 
-        # OZON не принимает больше 10 кампаний за раз — идём пачками
+        # OZON не принимает больше 10 кампаний за раз — идём пачками, параллельно
         if len(campaign_ids) > MAX_CAMPAIGNS_PER_REQUEST:
-            rows = []
-            for i in range(0, len(campaign_ids), MAX_CAMPAIGNS_PER_REQUEST):
-                chunk = campaign_ids[i:i + MAX_CAMPAIGNS_PER_REQUEST]
-                try:
-                    rows.extend(self.statistics(date_from, date_to, chunk, group_by))
-                except PerformanceAPIError as e:
-                    log.warning("[%s] пачка кампаний %d-%d пропущена: %s",
-                                self.name, i + 1, i + len(chunk), e)
+            chunks = [campaign_ids[i:i + MAX_CAMPAIGNS_PER_REQUEST]
+                      for i in range(0, len(campaign_ids), MAX_CAMPAIGNS_PER_REQUEST)]
+            workers = min(PARALLEL_BATCHES, len(chunks))
+            log.info("[%s] кампаний %d -> %d пачек по %d, в %d потока(ов)",
+                     self.name, len(campaign_ids), len(chunks),
+                     MAX_CAMPAIGNS_PER_REQUEST, workers)
+
+            started = time.monotonic()
+            rows, failed = [], 0
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                tasks = {
+                    pool.submit(self._statistics_batch, date_from, date_to,
+                                chunk, group_by): (n, chunk)
+                    for n, chunk in enumerate(chunks, 1)
+                }
+                for task in as_completed(tasks):
+                    n, chunk = tasks[task]
+                    try:
+                        rows.extend(task.result())
+                    except PerformanceAPIError as e:
+                        failed += 1
+                        log.warning("[%s] пачка %d/%d (кампании %s) пропущена: %s",
+                                    self.name, n, len(chunks), ",".join(chunk), e)
+
+            if failed:
+                log.warning("[%s] не собрано пачек: %d из %d — "
+                            "«реклама» и «ДРР» по этим кампаниям будут занижены",
+                            self.name, failed, len(chunks))
+            log.info("[%s] статистика рекламы собрана за %.0f с, строк: %d",
+                     self.name, time.monotonic() - started, len(rows))
             return rows
 
+        return self._statistics_batch(date_from, date_to, campaign_ids, group_by)
+
+    def _statistics_batch(self, date_from, date_to, campaign_ids, group_by="DATE"):
+        """Один отчёт по пачке не больше MAX_CAMPAIGNS_PER_REQUEST кампаний."""
         payload = {
             "campaigns": [str(c) for c in campaign_ids],
             "from": f"{date_from}T00:00:00.000Z",
@@ -171,17 +236,23 @@ class PerformanceAPI:
         if not uuid:
             raise PerformanceAPIError(f"[{self.name}] statistics: не получен UUID: {resp}")
 
-        # ожидание готовности
-        for _ in range(60):
+        # Ожидание готовности. Ограничение по времени, а не по числу опросов:
+        # когда пачек много, OZON ставит отчёты в очередь и ждать приходится
+        # дольше, чем при одиночном запросе.
+        deadline = time.monotonic() + REPORT_TIMEOUT
+        while time.monotonic() < deadline:
             st = self._get(f"/api/client/statistics/{uuid}").json()
             state = (st.get("state") or st.get("status") or "").upper()
             if state in ("OK", "SUCCESS", "DONE"):
                 break
             if state in ("ERROR", "FAILED"):
                 raise PerformanceAPIError(f"[{self.name}] отчёт рекламы завершился с ошибкой: {st}")
-            time.sleep(3)
+            time.sleep(POLL_INTERVAL)
         else:
-            raise PerformanceAPIError(f"[{self.name}] отчёт рекламы не готов за отведённое время")
+            raise PerformanceAPIError(
+                f"[{self.name}] отчёт рекламы не готов за {REPORT_TIMEOUT:.0f} с "
+                f"(кампании {','.join(str(c) for c in campaign_ids)})"
+            )
 
         # скачивание CSV
         r = self._get("/api/client/statistics/report", params={"UUID": uuid})
@@ -231,6 +302,15 @@ class PerformanceAPI:
         Грубое агрегирование расхода/кликов/показов из CSV рекламы.
         Ищет колонки по подстрокам, устойчиво к вариациям названий.
         """
+        def num(x):
+            if x is None:
+                return 0.0
+            x = str(x).replace("\xa0", "").replace(" ", "").replace(",", ".")
+            try:
+                return float(x)
+            except ValueError:
+                return 0.0
+
         totals = {"spend": 0.0, "clicks": 0.0, "views": 0.0}
         for row in rows:
             for k, v in row.items():
@@ -238,9 +318,9 @@ class PerformanceAPI:
                     continue
                 kl = k.lower()
                 if "расход" in kl or "spend" in kl or "cost" in kl:
-                    totals["spend"] += _num(v)
+                    totals["spend"] += num(v)
                 elif "клик" in kl or "click" in kl:
-                    totals["clicks"] += _num(v)
+                    totals["clicks"] += num(v)
                 elif "показ" in kl or "view" in kl or "impression" in kl:
-                    totals["views"] += _num(v)
+                    totals["views"] += num(v)
         return totals
