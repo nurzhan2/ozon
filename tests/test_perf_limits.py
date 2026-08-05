@@ -180,6 +180,29 @@ api.statistics("2026-08-01", "2026-08-01")
 status = [c for c in api.session.calls if c.startswith("/api/client/statistics/u")]
 check("опросы статуса считаются и ограничены", len(status) == 8, len(status))
 
+# ------------------------------------------------- 5. отсев давно мёртвых
+print("\n5. Отсев неработающих и давно не менявшихся (PERF_STALE_DAYS)")
+A = PA2.PerformanceAPI
+old_inactive = {"id": "1", "state": "CAMPAIGN_STATE_INACTIVE",
+                "createdAt": "2024-02-08T14:27:56Z", "updatedAt": "2024-03-10T16:35:08Z"}
+old_running = {"id": "2", "state": "CAMPAIGN_STATE_RUNNING",
+               "createdAt": "2024-02-08T14:27:56Z", "updatedAt": "2024-03-10T16:35:08Z"}
+fresh_inactive = {"id": "3", "state": "CAMPAIGN_STATE_INACTIVE",
+                  "createdAt": "2024-01-01T00:00:00Z", "updatedAt": "2026-08-03T10:00:00Z"}
+nodates = {"id": "4", "state": "CAMPAIGN_STATE_INACTIVE"}
+DF = "2026-08-01"
+check("выключено по умолчанию — ничего не режет", not A.is_stale(old_inactive, DF, 0))
+check("старая неактивная отсеивается", A.is_stale(old_inactive, DF, 7))
+check("работающая не трогается никогда", not A.is_stale(old_running, DF, 7))
+check("неактивная, но менялась внутри периода — остаётся",
+      not A.is_stale(fresh_inactive, DF, 7))
+check("без дат не режем", not A.is_stale(nodates, DF, 7))
+check("last_touch берёт максимум по всем полям",
+      A.last_touch(fresh_inactive) == "2026-08-03", A.last_touch(fresh_inactive))
+check("запас в днях работает: остановлена за 2 дня до периода при запасе 7 — остаётся",
+      not A.is_stale({"id": "5", "state": "CAMPAIGN_STATE_INACTIVE",
+                      "updatedAt": "2026-07-30T00:00:00Z"}, DF, 7))
+
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 shutil.rmtree(CACHE, ignore_errors=True)
 sys.exit(0 if ok else 1)

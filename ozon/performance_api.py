@@ -35,7 +35,7 @@ import json
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -98,6 +98,19 @@ CACHE_DIR = (os.environ.get("PERF_CACHE_DIR")
 SKIP_STATES = {s.strip().upper()
                for s in os.environ.get("PERF_SKIP_STATES", "ARCHIVED").split(",")
                if s.strip()}
+
+# Отсев давно не менявшихся неработающих кампаний.
+#
+# В кабинетах их много: у «Бьютифул» 105 неактивных из 221, часть создана
+# в 2024 году и с тех пор не трогалась. Такая кампания не могла тратить бюджет
+# в отчётном периоде, но пачку под себя занимает и стоит запросов.
+#
+# ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО (0). Включать — только посмотрев в perf_audit.py,
+# сколько кампаний фильтр уносит: ошибка здесь занижает «рекламу» и «ДРР»
+# молча, а это ровно те колонки, ради которых отчёт и собирается.
+# Значение — запас в днях до начала периода: при 7 отсеиваются кампании,
+# не менявшиеся дольше чем за неделю до его начала.
+STALE_DAYS = int(os.environ.get("PERF_STALE_DAYS", "0"))
 
 # Искать ли виновные кампании делением пачки пополам при отказе «отчёт этого
 # типа запрещён». Один раз дорого, зато результат сохраняется на диск.
@@ -373,6 +386,40 @@ class PerformanceAPI:
         end = _norm_date(raw)
         return bool(end) and len(end) == 10 and end < str(date_from)
 
+    @staticmethod
+    def last_touch(c):
+        """
+        Самая поздняя дата, какая известна про кампанию. Берём максимум из всех
+        полей: если хоть одно позже начала периода, кампания могла быть живой.
+        """
+        best = ""
+        for key in ("updatedAt", "toDate", "fromDate", "createdAt",
+                    "updated_at", "created_at", "dateTo", "dateFrom"):
+            v = _norm_date(c.get(key))
+            if len(v) == 10 and v > best:
+                best = v
+        return best
+
+    @classmethod
+    def is_stale(cls, c, date_from, stale_days):
+        """
+        Кампания не работает и давно не менялась — в отчётном периоде она
+        тратить не могла. RUNNING не трогаем никогда: кампания может крутиться
+        годами без единой правки, и updatedAt у неё старый.
+        """
+        if not stale_days or not date_from:
+            return False
+        if cls._state_of(c) == "RUNNING":
+            return False
+        touch = cls.last_touch(c)
+        if not touch:
+            return False
+        try:
+            cutoff = date.fromisoformat(str(date_from)[:10]) - timedelta(days=stale_days)
+        except ValueError:
+            return False
+        return touch < cutoff.isoformat()
+
     def _mark_forbidden(self, ids):
         ids = [str(i) for i in ids]
         with _FILE_LOCK:
@@ -406,7 +453,8 @@ class PerformanceAPI:
             log.info("[%s] кампаний в кабинете %d (%s)", self.name, len(items),
                      ", ".join(f"{k}={v}" for k, v in sorted(by_state.items())))
 
-        kept, dropped_state, dropped_black, dropped_period = [], 0, 0, 0
+        kept = []
+        dropped_state = dropped_black = dropped_period = dropped_stale = 0
         all_ids = []
         for c in items:
             cid = str(c.get("id") or c.get("campaignId") or "").strip()
@@ -422,6 +470,9 @@ class PerformanceAPI:
             if date_from and self._ended_before(c, date_from):
                 dropped_period += 1
                 continue
+            if self.is_stale(c, date_from, STALE_DAYS):
+                dropped_stale += 1
+                continue
             kept.append(cid)
 
         if not kept and all_ids:
@@ -429,10 +480,16 @@ class PerformanceAPI:
             kept = [i for i in all_ids if i not in self._forbidden]
             log.warning("[%s] ни одна кампания не прошла фильтр по статусу — "
                         "беру все %d", self.name, len(kept))
-        elif dropped_state or dropped_black or dropped_period:
+        elif dropped_state or dropped_black or dropped_period or dropped_stale:
             log.info("[%s] в отчёт пойдут %d кампаний: пропущено %d по статусу, "
-                     "%d из чёрного списка, %d завершились до начала периода",
-                     self.name, len(kept), dropped_state, dropped_black, dropped_period)
+                     "%d из чёрного списка, %d завершились до начала периода, "
+                     "%d не работают и давно не менялись",
+                     self.name, len(kept), dropped_state, dropped_black,
+                     dropped_period, dropped_stale)
+        if dropped_stale:
+            log.warning("[%s] отсев по PERF_STALE_DAYS=%d убрал %d кампаний — "
+                        "если «реклама» просела, поставьте PERF_STALE_DAYS=0",
+                        self.name, STALE_DAYS, dropped_stale)
         return kept
 
     # ------------------------------------------------------------ статистика

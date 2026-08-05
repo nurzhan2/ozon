@@ -30,7 +30,7 @@ except ImportError:
 
 from ozon.performance_api import (
     PerformanceAPI, MAX_CAMPAIGNS_PER_REQUEST, SKIP_STATES,
-    DAILY_BUDGET, OZON_DAILY_LIMIT,
+    DAILY_BUDGET, OZON_DAILY_LIMIT, STALE_DAYS, _norm_date,
 )
 from ozon import dates as D
 
@@ -41,6 +41,10 @@ FIELDS = ("id", "title", "state", "advObjectType", "paymentType",
 
 def describe(c):
     return {k: c.get(k) for k in FIELDS if c.get(k) not in (None, "")}
+
+
+def _norm(x):
+    return _norm_date(x)
 
 
 def audit(store, date_from, date_to):
@@ -83,27 +87,60 @@ def audit(store, date_from, date_to):
     print(f"  израсходовано сегодня: {spent}"
           + ("  (лимит уже помечен как исчерпанный)" if api._usage.get("blocked") else ""))
 
+    # --- сколько сэкономил бы отсев неработающих и давно не менявшихся ---
+    print("\n  отсев по PERF_STALE_DAYS (сейчас "
+          f"{STALE_DAYS if STALE_DAYS else 'выключен'}):")
+    kept_set = set(kept)
+    candidates = [c for c in items if str(c.get("id")) in kept_set]
+    for days in (0, 3, 7, 30):
+        stale = [c for c in candidates
+                 if PerformanceAPI.is_stale(c, date_from, days)] if days else []
+        left = len(candidates) - len(stale)
+        b = (left + MAX_CAMPAIGNS_PER_REQUEST - 1) // MAX_CAMPAIGNS_PER_REQUEST
+        mark = "  <- сейчас" if days == STALE_DAYS else ""
+        print(f"    {days:>3} дн: отсеет {len(stale):>3}, останется {left:>3} "
+              f"-> {b} пачек, примерно {b * 5 * 9}-{b * 9 * 9} запросов в сутки{mark}")
+    stale7 = [c for c in candidates if PerformanceAPI.is_stale(c, date_from, 7)]
+    if stale7:
+        newest = max(PerformanceAPI.last_touch(c) for c in stale7)
+        print(f"    самая свежая из отсеиваемых при 7 дн менялась {newest} "
+              f"(период начинается {date_from})")
+
     if api._forbidden:
-        print(f"\n  чёрный список ({len(api._forbidden)} шт.) — OZON запретил по ним отчёт:")
         bad = [c for c in items if str(c.get("id")) in api._forbidden]
+        print(f"\n  чёрный список ({len(api._forbidden)} шт.) — OZON запретил по ним отчёт:")
         for c in bad[:10]:
             print("    " + str(describe(c)))
         if len(bad) > 10:
             print(f"    ... и ещё {len(bad) - 10}")
-        good = [c for c in items if str(c.get("id")) in set(kept)]
-        if good:
-            print("\n  для сравнения — рабочая кампания:")
-            print("    " + str(describe(good[0])))
+
         bad_types = Counter(str(c.get("advObjectType") or "?") for c in bad)
-        good_types = Counter(str(c.get("advObjectType") or "?") for c in good)
-        print(f"\n  типы запрещённых: {dict(bad_types)}")
-        print(f"  типы рабочих:     {dict(good_types)}")
-        only_bad = set(bad_types) - set(good_types)
+        cand_types = Counter(str(c.get("advObjectType") or "?") for c in candidates)
+        print(f"\n  типы запрещённых:              {dict(bad_types)}")
+        print(f"  типы кандидатов в отчёт:       {dict(cand_types)}")
+        print("  (кандидаты — это те, кого мы СОБИРАЕМСЯ запросить, а не те,")
+        print("   про кого известно, что отчёт по ним проходит)")
+
+        # Тип сам по себе редко виноват: у одного магазина SEARCH_PROMO
+        # отдаётся, у другого нет. Разделяет обычно возраст кампании.
+        bad_created = sorted(_norm(c.get("createdAt")) for c in bad
+                             if _norm(c.get("createdAt")))
+        if bad_created:
+            print(f"  запрещённые созданы: {bad_created[0]} .. {bad_created[-1]}")
+        for t in sorted(set(bad_types)):
+            same = [c for c in candidates
+                    if str(c.get("advObjectType") or "?") == t]
+            created = sorted(_norm(c.get("createdAt")) for c in same
+                             if _norm(c.get("createdAt")))
+            if created:
+                print(f"  кандидаты типа {t}: {len(same)} шт., "
+                      f"созданы {created[0]} .. {created[-1]}")
+        only_bad = set(bad_types) - set(cand_types)
         if only_bad:
-            print(f"  >> эти типы встречаются ТОЛЬКО у запрещённых: {sorted(only_bad)}")
-            print("     их можно отсеивать сразу, не тратя запросы на поиск")
+            print(f"  >> тип {sorted(only_bad)} остался только у запрещённых — "
+                  "можно отсекать сразу")
     else:
-        print("  чёрный список пуст")
+        print("\n  чёрный список пуст")
 
     print(f"\n  фильтр по статусам сейчас отсекает: {sorted(SKIP_STATES) or '—'}")
 
