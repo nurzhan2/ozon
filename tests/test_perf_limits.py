@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Офлайн-проверка правок performance_api / collector: сеть подменена."""
-import os, sys, json, shutil, logging, tempfile
+import os, sys, json, time, shutil, logging, tempfile
 
 CACHE = tempfile.mkdtemp(prefix="perfcache_")
 os.environ["PERF_CACHE_DIR"] = CACHE
@@ -202,6 +202,43 @@ check("last_touch берёт максимум по всем полям",
 check("запас в днях работает: остановлена за 2 дня до периода при запасе 7 — остаётся",
       not A.is_stale({"id": "5", "state": "CAMPAIGN_STATE_INACTIVE",
                       "updatedAt": "2026-07-30T00:00:00Z"}, DF, 7))
+
+# ----------------------------------- 6. пробная попытка после отказа OZON
+print("\n6. Возврат к работе после отказа OZON по суточному лимиту")
+PA2.BLOCK_RETRY_HOURS = 3.0
+api = PA2.PerformanceAPI("cid6", "s", name="ТЕСТ")
+api.session = FakeSession(campaigns=camps(spec2[:10]), daily_limit=3)
+api.statistics("2026-08-01", "2026-08-01")
+check("после 429 клиент заблокирован", api._usage.get("blocked") is True)
+check("это отказ OZON, а не наш потолок", api._usage.get("own_limit") is False)
+
+api2 = PA2.PerformanceAPI("cid6", "s", name="ТЕСТ")
+api2.session = FakeSession(campaigns=camps(spec2[:10]))
+api2.statistics("2026-08-01", "2026-08-01")
+check("сразу после отказа не пробуем", api2.session.n == 0, api2.session.n)
+
+# отматываем отметку отказа на 4 часа назад
+api3 = PA2.PerformanceAPI("cid6", "s", name="ТЕСТ")
+api3._usage["blocked_at"] = time.time() - 4 * 3600
+api3.session = FakeSession(campaigns=camps(spec2[:10]))
+rows = api3.statistics("2026-08-01", "2026-08-01")
+check("через 4 часа пробуем снова и собираем", len(rows) == 10, len(rows))
+check("блокировка снята", api3._usage.get("blocked") is False, api3._usage)
+
+# свой потолок пробой не лечится
+PA2.DAILY_BUDGET = 5
+api4 = PA2.PerformanceAPI("cid7", "s", name="ТЕСТ")
+api4.session = FakeSession(campaigns=camps(spec2[:20]))
+api4.statistics("2026-08-01", "2026-08-01")
+check("свой потолок помечен как own_limit", api4._usage.get("own_limit") is True,
+      api4._usage)
+api5 = PA2.PerformanceAPI("cid7", "s", name="ТЕСТ")
+api5._usage["blocked_at"] = time.time() - 10 * 3600
+api5.session = FakeSession(campaigns=camps(spec2[:10]))
+api5.statistics("2026-08-01", "2026-08-01")
+check("свой потолок не пробуется даже через 10 часов", api5.session.n == 0,
+      api5.session.n)
+PA2.DAILY_BUDGET = 1500
 
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 shutil.rmtree(CACHE, ignore_errors=True)

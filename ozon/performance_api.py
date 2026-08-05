@@ -86,6 +86,11 @@ POLL_NOTICE = float(os.environ.get("PERF_POLL_NOTICE", "30"))
 OZON_DAILY_LIMIT = 2000
 DAILY_BUDGET = int(os.environ.get("PERF_DAILY_BUDGET", "1500"))
 
+# Через сколько часов после отказа OZON по суточному лимиту сделать пробную
+# попытку. Их окно считается не по московской полуночи, так что ждать до утра
+# значит терять день рекламы там, где лимит уже отпустило. 0 — не пробовать.
+BLOCK_RETRY_HOURS = float(os.environ.get("PERF_BLOCK_RETRY_HOURS", "3"))
+
 # Куда складывать счётчик запросов и чёрный список кампаний. На Railway
 # DATA_DIR=/data — это постоянный диск, файлы переживают деплой.
 CACHE_DIR = (os.environ.get("PERF_CACHE_DIR")
@@ -209,6 +214,8 @@ class PerformanceAPI:
         self._isolate_left = ISOLATE_MAX
         self._requests_run = 0
         self._pending_writes = 0
+        self._probed_at = 0.0
+        self._probe_allowed = False
         # У отчёта может не оказаться колонки с датой. Тогда расход нельзя
         # разложить по дням, а значит и нарезать кэш на подпериоды.
         self.last_spend_dated = True
@@ -227,15 +234,37 @@ class PerformanceAPI:
         if spent:
             log.info("[%s] за сегодня уже израсходовано запросов рекламы: %d из %d",
                      self.name, spent, DAILY_BUDGET or OZON_DAILY_LIMIT)
+        if self._usage.get("blocked"):
+            log.warning("[%s] сбор рекламы приостановлен: %s",
+                        self.name, self._block_reason())
 
     # ---------------------------------------------------------- учёт запросов
+    @staticmethod
+    def _fresh_usage():
+        return {"date": _msk_date(), "count": 0, "blocked": False,
+                "blocked_at": 0, "reason": "", "own_limit": False}
+
     def _load_usage(self):
         u = _read_json(self._usage_path, {})
         if u.get("date") != _msk_date():
-            u = {"date": _msk_date(), "count": 0, "blocked": False}
-        u.setdefault("count", 0)
-        u.setdefault("blocked", False)
+            return self._fresh_usage()
+        for k, v in self._fresh_usage().items():
+            u.setdefault(k, v)
         return u
+
+    def _block_reason(self):
+        """Человеческое объяснение, почему сбор стоит и когда снова попробуем."""
+        why = self._usage.get("reason") or "суточный лимит запросов исчерпан"
+        if self._usage.get("own_limit"):
+            return (f"{why}. Это НАШ потолок, а не отказ OZON: до конца суток "
+                    f"по Москве запросов больше не будет")
+        at = float(self._usage.get("blocked_at") or 0)
+        if at and BLOCK_RETRY_HOURS:
+            waited = (time.time() - at) / 3600.0
+            left = max(0.0, BLOCK_RETRY_HOURS - waited)
+            return (f"{why}. Отказ пришёл от OZON {waited:.1f} ч назад; "
+                    f"пробную попытку сделаем через {left:.1f} ч")
+        return why
 
     def _save_usage(self, force=False):
         self._pending_writes += 1
@@ -246,36 +275,96 @@ class PerformanceAPI:
     def _count_request(self):
         with _FILE_LOCK:
             if self._usage.get("date") != _msk_date():
-                self._usage = {"date": _msk_date(), "count": 0, "blocked": False}
+                self._usage = self._fresh_usage()
                 self._quota_hit = False
                 self._isolate_left = ISOLATE_MAX
             self._usage["count"] += 1
             self._requests_run += 1
             self._save_usage()
 
-    def _mark_quota_exhausted(self, reason=""):
+    def _mark_quota_exhausted(self, reason="", own_limit=False):
         with _FILE_LOCK:
             self._usage["blocked"] = True
+            self._usage["blocked_at"] = time.time()
+            self._usage["reason"] = reason
+            self._usage["own_limit"] = bool(own_limit)
             self._save_usage(force=True)
+        self._probe_allowed = False
         self._quota_hit = True
-        log.error("[%s] СУТОЧНЫЙ ЛИМИТ ЗАПРОСОВ РЕКЛАМЫ ИСЧЕРПАН%s. "
-                  "До полуночи по Москве реклама собираться не будет; "
-                  "«реклама» и «ДРР» в отчётах будут занижены.",
-                  self.name, f" ({reason})" if reason else "")
+        if own_limit:
+            log.error("[%s] ОСТАНОВЛЕНО НАШИМ ПОТОЛКОМ: %s. "
+                      "До конца суток по Москве реклама собираться не будет; "
+                      "«реклама» и «ДРР» в отчётах будут занижены.",
+                      self.name, reason)
+        else:
+            log.error("[%s] OZON ОТКАЗАЛ ПО СУТОЧНОМУ ЛИМИТУ (%s). "
+                      "Пробную попытку сделаем через %.0f ч; до тех пор "
+                      "«реклама» и «ДРР» будут занижены.",
+                      self.name, reason or "429", BLOCK_RETRY_HOURS)
+
+    def _clear_block(self):
+        """Пробный запрос прошёл — значит на стороне OZON счётчик отпустило."""
+        with _FILE_LOCK:
+            self._usage["blocked"] = False
+            self._usage["blocked_at"] = 0
+            self._usage["reason"] = ""
+            self._usage["own_limit"] = False
+            self._save_usage(force=True)
+        self._probe_allowed = False
+        self._quota_hit = False
+        log.info("[%s] лимит OZON отпустило — продолжаю сбор рекламы", self.name)
+
+    def _probing(self):
+        """Идёт ли сейчас разрешённая пробная попытка."""
+        return self._probe_allowed or self._can_probe()
+
+    def _can_probe(self):
+        """
+        Разрешить одну пробную попытку после отказа OZON.
+
+        Суточное окно OZON считается не по московской полуночи (это видно по
+        тому, что отказ доживал до следующих суток нашего счётчика), поэтому
+        держать сбор выключенным до утра неправильно: можно потерять день
+        рекламы там, где лимит уже отпустило. Попытка стоит одного запроса,
+        а при повторном отказе блокировка ставится заново.
+
+        Свой собственный потолок пробой не лечится — он на то и потолок.
+        """
+        if self._usage.get("own_limit") or not BLOCK_RETRY_HOURS:
+            return False
+        at = float(self._usage.get("blocked_at") or 0)
+        if not at:
+            return False
+        waited = time.time() - at
+        if waited < BLOCK_RETRY_HOURS * 3600:
+            return False
+        if self._probed_at and (time.time() - self._probed_at) < BLOCK_RETRY_HOURS * 3600:
+            return False
+        self._probed_at = time.time()
+        self._probe_allowed = True
+        log.info("[%s] с отказа OZON по лимиту прошло %.1f ч — пробую один запрос",
+                 self.name, waited / 3600.0)
+        return True
 
     def _guard_quota(self):
-        if self._quota_hit or self._usage.get("blocked"):
-            self._quota_hit = True
-            raise PerformanceQuotaError(
-                f"[{self.name}] суточный лимит запросов рекламы исчерпан"
-            )
+        # Свой потолок проверяем первым: он окончательный на эти сутки.
         if DAILY_BUDGET and self._usage.get("count", 0) >= DAILY_BUDGET:
-            self._mark_quota_exhausted(
-                f"свой потолок PERF_DAILY_BUDGET={DAILY_BUDGET}, "
-                f"лимит OZON — {OZON_DAILY_LIMIT}")
+            if not self._usage.get("blocked"):
+                self._mark_quota_exhausted(
+                    f"израсходован бюджет PERF_DAILY_BUDGET={DAILY_BUDGET} "
+                    f"(лимит OZON — {OZON_DAILY_LIMIT})", own_limit=True)
+            self._quota_hit = True
             raise PerformanceQuotaError(
                 f"[{self.name}] израсходован суточный бюджет запросов "
                 f"({DAILY_BUDGET})"
+            )
+
+        if self._quota_hit or self._usage.get("blocked"):
+            if self._probing():
+                return
+            self._quota_hit = True
+            raise PerformanceQuotaError(
+                f"[{self.name}] {self._block_reason()}"
             )
 
     def requests_left(self):
@@ -339,6 +428,8 @@ class PerformanceAPI:
             r = self.session.request(method, BASE_URL + path,
                                      timeout=self.timeout, **kw)
             if r.status_code in ok_codes:
+                if self._usage.get("blocked"):
+                    self._clear_block()
                 return r
 
             body = r.text[:300]
@@ -500,9 +591,8 @@ class PerformanceAPI:
         отличаться по локали: 'Расход, руб.', 'Клики', 'Показы', и т.п.).
         date_from/date_to: 'YYYY-MM-DD'.
         """
-        if self._quota_hit or self._usage.get("blocked"):
-            log.error("[%s] реклама пропущена: суточный лимит запросов исчерпан",
-                      self.name)
+        if (self._quota_hit or self._usage.get("blocked")) and not self._probing():
+            log.error("[%s] реклама пропущена: %s", self.name, self._block_reason())
             return []
 
         if campaign_ids is None:
@@ -520,7 +610,22 @@ class PerformanceAPI:
             campaign_ids = campaign_ids[:MAX_CAMPAIGNS_TOTAL]
 
         if len(campaign_ids) <= MAX_CAMPAIGNS_PER_REQUEST:
-            return self._batch_isolating(date_from, date_to, campaign_ids, group_by)
+            # Одна пачка обрабатывается так же, как любая из многих: отказ
+            # логируется и возвращается пустой результат. Иначе у магазина
+            # с десятком кампаний ошибка летела наружу, а у магазина с сотней
+            # та же самая ошибка тихо превращалась в предупреждение.
+            try:
+                return self._batch_isolating(date_from, date_to, campaign_ids, group_by)
+            except PerformanceQuotaError:
+                log.error("[%s] сбор рекламы прерван: %s",
+                          self.name, self._block_reason())
+                return []
+            except Exception as e:
+                log.warning("[%s] единственная пачка (кампании %s) пропущена: "
+                            "%s: %s — «реклама» и «ДРР» будут занижены",
+                            self.name, ",".join(str(c) for c in campaign_ids),
+                            type(e).__name__, e)
+                return []
 
         # OZON не принимает больше 10 кампаний за раз — идём пачками
         chunks = [campaign_ids[i:i + MAX_CAMPAIGNS_PER_REQUEST]
