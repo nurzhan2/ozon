@@ -15,6 +15,16 @@ from . import dates as D
 log = logging.getLogger("ozon.collector")
 
 
+def _slice_days(data, date_from, date_to):
+    """Вырезает из {товар: {день: расход}} только дни внутри периода."""
+    out = {}
+    for key, days in (data or {}).items():
+        sub = {d: v for d, v in days.items() if date_from <= d <= date_to}
+        if sub:
+            out[key] = sub
+    return out
+
+
 class StoreCollector:
     def __init__(self, store_cfg, enable_performance=True, exclude_marker="OUT"):
         self.cfg = store_cfg
@@ -31,7 +41,14 @@ class StoreCollector:
         self._offer_map = None
         self._stocks = None
         self._cluster_rows = None
-        self._ad_cache = {}
+        # Один собранный период рекламы на весь запуск. Отчёты просят разные
+        # отрезки (месяц с начала, вчера, позавчера), но все они лежат внутри
+        # самого широкого — его и режем локально, вместо новых походов в API.
+        # Раньше каждый отрезок стоил полного прохода по всем кампаниям, и
+        # утренний пакет тратил три прохода вместо одного.
+        self._ad_data = {}
+        self._ad_range = None       # ('YYYY-MM-DD', 'YYYY-MM-DD') или None
+        self._ad_dated = True
 
     # ---------------- справочники ----------------
     def maps(self):
@@ -121,19 +138,47 @@ class StoreCollector:
 
     # ---------------- реклама ----------------
     def ad_spend(self, date_from, date_to):
-        """{ключ_товара: {день: расход}} — с кэшем по периоду."""
+        """
+        {ключ_товара: {день: расход}} за запрошенный период.
+
+        Ходит в Performance API не больше одного раза за запуск: отчёт идёт с
+        группировкой по дням, поэтому уже собранный широкий период режется по
+        датам локально. Стоимость похода — примерно сотня запросов из суточных
+        двух тысяч на аккаунт, так что экономия здесь принципиальная, а не
+        косметическая.
+        """
         if not self.perf:
             return {}
-        key = (date_from, date_to)
-        if key in self._ad_cache:
-            return self._ad_cache[key]
+        df = D.d(date_from) if hasattr(date_from, "strftime") else str(date_from)
+        dt = D.d(date_to) if hasattr(date_to, "strftime") else str(date_to)
+
+        have = self._ad_range
+        if have and have[0] <= df and dt <= have[1]:
+            if not self._ad_dated and (df, dt) != have:
+                # В отчёте не было колонки с датой: резать нечего и нельзя.
+                log.warning("[%s] расход рекламы без разбивки по дням — "
+                            "период %s..%s взят целиком", self.name, *have)
+                return self._ad_data
+            return _slice_days(self._ad_data, df, dt)
+
+        # Расширяемся до объединения с уже собранным, чтобы второй поход
+        # закрыл сразу всё, что может понадобиться дальше.
+        need_from = min(df, have[0]) if have else df
+        need_to = max(dt, have[1]) if have else dt
         try:
-            data = self.perf.spend_by_product_day(date_from, date_to)
+            self._ad_data = self.perf.spend_by_product_day(need_from, need_to)
+            self._ad_dated = getattr(self.perf, "last_spend_dated", True)
+            self._ad_range = (need_from, need_to)
         except Exception as e:
             log.warning("[%s] реклама недоступна: %s", self.name, e)
-            data = {}
-        self._ad_cache[key] = data
-        return data
+            # Запоминаем неудачу как закрытый период: повторять поход в тот же
+            # API в рамках одного запуска бессмысленно и дорого по лимиту.
+            if not have:
+                self._ad_data, self._ad_dated = {}, True
+                self._ad_range = (need_from, need_to)
+            return _slice_days(self._ad_data, df, dt) if self._ad_dated else self._ad_data
+
+        return _slice_days(self._ad_data, df, dt) if self._ad_dated else self._ad_data
 
     def performance_totals(self, date_from, date_to):
         if not self.perf:

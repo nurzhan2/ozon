@@ -11,17 +11,37 @@
   2) GET  /api/client/statistics/{uuid} -> ждём статус OK
   3) GET  /api/client/statistics/report -> скачиваем CSV
 
-Реализован сбор агрегированных показателей рекламы за период по кампаниям.
-Если реклама не нужна — модуль можно не использовать (ENABLE_PERFORMANCE=False).
+ГЛАВНОЕ ОГРАНИЧЕНИЕ: 2000 запросов на рекламный аккаунт в сутки.
+Один отчёт по пачке из 10 кампаний — это 1 POST + N опросов статуса + 1
+скачивание, то есть 6-17 запросов. При 120 кампаниях полный проход по
+магазину стоит около сотни запросов, а за сутки воркер делает такой проход
+десяток раз (утренний пакет + промежуточные каждые 2 часа). Поэтому здесь
+всё построено вокруг экономии запросов:
+
+  * счётчик расхода за сутки лежит на диске и переживает перезапуск;
+  * кампании, по которым OZON запрещает этот тип отчёта, попадают в
+    постоянный чёрный список и больше не запрашиваются;
+  * архивные кампании и кампании, закончившиеся до начала периода,
+    отсеиваются до формирования пачек;
+  * опрос статуса идёт с нарастающей паузой, а не каждые 3 секунды.
+
+Если реклама не нужна — модуль можно не использовать (ENABLE_PERFORMANCE=0).
 """
 
 import io
 import os
 import csv
+import json
 import time
 import logging
 import threading
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:                                   # Python < 3.9
+    ZoneInfo = None
 
 import requests
 
@@ -36,8 +56,7 @@ MAX_CAMPAIGNS_PER_REQUEST = 10
 # Верхняя граница на число кампаний в отчёте. 0 — без ограничения, берутся ВСЕ.
 # По умолчанию именно 0: усечение молча искажает «рекламу» и «ДРР», а это те
 # самые колонки, ради которых отчёт и собирается. Переменная оставлена как
-# аварийный тормоз, если у магазина окажутся сотни кампаний и сбор перестанет
-# укладываться в окно до 8 утра.
+# аварийный тормоз, если у магазина окажутся сотни кампаний.
 MAX_CAMPAIGNS_TOTAL = int(os.environ.get("PERF_MAX_CAMPAIGNS", "0"))
 
 # Сколько пачек собирать одновременно.
@@ -46,17 +65,47 @@ MAX_CAMPAIGNS_TOTAL = int(os.environ.get("PERF_MAX_CAMPAIGNS", "0"))
 # активный запрос статистики на аккаунт: при попытке запустить второй он
 # отвечает 429 «Превышен лимит активных запросов (максимум 1)». Проверено на
 # боевом аккаунте — при четырёх потоках отвалились 4 пачки из 12.
-#
-# Параметр оставлен на случай, если OZON когда-нибудь поднимет лимит. Ставить
-# больше 1 сейчас — гарантированно терять часть расхода на рекламу.
 PARALLEL_BATCHES = max(1, int(os.environ.get("PERF_PARALLEL", "1")))
 
-# Сколько ждать готовности одного отчёта и как часто спрашивать статус.
+# Сколько ждать готовности одного отчёта.
 REPORT_TIMEOUT = float(os.environ.get("PERF_REPORT_TIMEOUT", "300"))
-POLL_INTERVAL = float(os.environ.get("PERF_POLL_INTERVAL", "3"))
+
+# Опрос статуса с нарастающей паузой. Фиксированные 3 секунды означали, что
+# отчёт, готовящийся 45 секунд, стоил 15 запросов из суточных 2000. С ростом
+# паузы тот же отчёт обходится в 7 запросов, а задержка растёт секунд на пять.
+POLL_START = float(os.environ.get("PERF_POLL_START", "2"))
+POLL_MAX = float(os.environ.get("PERF_POLL_MAX", "15"))
+POLL_GROWTH = float(os.environ.get("PERF_POLL_GROWTH", "1.6"))
 
 # Как часто напоминать в лог, что отчёт всё ещё готовится.
 POLL_NOTICE = float(os.environ.get("PERF_POLL_NOTICE", "30"))
+
+# Суточный лимит OZON и наш собственный потолок с запасом. Упереться в чужой
+# лимит — значит получить 429 на середине сбора и потерять данные без предупре-
+# ждения; свой потолок даёт остановиться заранее и написать об этом в лог.
+OZON_DAILY_LIMIT = 2000
+DAILY_BUDGET = int(os.environ.get("PERF_DAILY_BUDGET", "1500"))
+
+# Куда складывать счётчик запросов и чёрный список кампаний. На Railway
+# DATA_DIR=/data — это постоянный диск, файлы переживают деплой.
+CACHE_DIR = (os.environ.get("PERF_CACHE_DIR")
+             or os.path.join(os.environ.get("DATA_DIR", "."), "cache"))
+
+# Статусы кампаний, которые не попадают в отчёт. По умолчанию только архивные:
+# именно на них OZON отвечает «generation of this type of report is forbidden».
+# Остановленные и неактивные оставляем — они могли тратить деньги в начале
+# периода, и выкинуть их значит занизить «рекламу» и «ДРР».
+SKIP_STATES = {s.strip().upper()
+               for s in os.environ.get("PERF_SKIP_STATES", "ARCHIVED").split(",")
+               if s.strip()}
+
+# Искать ли виновные кампании делением пачки пополам при отказе «отчёт этого
+# типа запрещён». Один раз дорого, зато результат сохраняется на диск.
+ISOLATE_FORBIDDEN = (os.environ.get("PERF_ISOLATE_FORBIDDEN", "1").strip().lower()
+                     not in ("0", "false", "no"))
+ISOLATE_MAX = int(os.environ.get("PERF_ISOLATE_MAX", "120"))
+
+_FILE_LOCK = threading.Lock()
 
 
 def _num(x):
@@ -82,7 +131,47 @@ def _norm_date(x):
     return s[:10]
 
 
+def _msk_date():
+    """Дата по Москве — в этих сутках OZON считает свои 2000 запросов."""
+    if ZoneInfo:
+        return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d")
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def _safe_name(s):
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(s))[:64]
+
+
+def _read_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(path, data):
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.debug("не удалось записать %s: %s", path, e)
+
+
 class PerformanceAPIError(Exception):
+    pass
+
+
+class PerformanceQuotaError(PerformanceAPIError):
+    """Суточный лимит запросов исчерпан — до завтра просить бесполезно."""
+    pass
+
+
+class PerformanceForbiddenReport(PerformanceAPIError):
+    """OZON отказал в отчёте по этому набору кампаний (400 InvalidArgument)."""
     pass
 
 
@@ -101,6 +190,86 @@ class PerformanceAPI:
         # и один затрёт заголовок другого на полуслове.
         self._auth_lock = threading.Lock()
 
+        self._campaigns_cache = None
+        self._campaigns_logged = False
+        self._quota_hit = False
+        self._isolate_left = ISOLATE_MAX
+        self._requests_run = 0
+        self._pending_writes = 0
+        # У отчёта может не оказаться колонки с датой. Тогда расход нельзя
+        # разложить по дням, а значит и нарезать кэш на подпериоды.
+        self.last_spend_dated = True
+
+        tag = _safe_name(client_id)
+        self._usage_path = os.path.join(CACHE_DIR, f"perf_usage_{tag}.json")
+        self._forbid_path = os.path.join(CACHE_DIR, f"perf_forbidden_{tag}.json")
+        self._forbidden = set(str(x) for x in
+                              _read_json(self._forbid_path, {}).get("ids", []))
+        self._usage = self._load_usage()
+
+        if self._forbidden:
+            log.info("[%s] в чёрном списке кампаний: %d (отчёт по ним запрещён OZON)",
+                     self.name, len(self._forbidden))
+        spent = self._usage.get("count", 0)
+        if spent:
+            log.info("[%s] за сегодня уже израсходовано запросов рекламы: %d из %d",
+                     self.name, spent, DAILY_BUDGET or OZON_DAILY_LIMIT)
+
+    # ---------------------------------------------------------- учёт запросов
+    def _load_usage(self):
+        u = _read_json(self._usage_path, {})
+        if u.get("date") != _msk_date():
+            u = {"date": _msk_date(), "count": 0, "blocked": False}
+        u.setdefault("count", 0)
+        u.setdefault("blocked", False)
+        return u
+
+    def _save_usage(self, force=False):
+        self._pending_writes += 1
+        if force or self._pending_writes >= 5:
+            self._pending_writes = 0
+            _write_json(self._usage_path, self._usage)
+
+    def _count_request(self):
+        with _FILE_LOCK:
+            if self._usage.get("date") != _msk_date():
+                self._usage = {"date": _msk_date(), "count": 0, "blocked": False}
+                self._quota_hit = False
+                self._isolate_left = ISOLATE_MAX
+            self._usage["count"] += 1
+            self._requests_run += 1
+            self._save_usage()
+
+    def _mark_quota_exhausted(self, reason=""):
+        with _FILE_LOCK:
+            self._usage["blocked"] = True
+            self._save_usage(force=True)
+        self._quota_hit = True
+        log.error("[%s] СУТОЧНЫЙ ЛИМИТ ЗАПРОСОВ РЕКЛАМЫ ИСЧЕРПАН%s. "
+                  "До полуночи по Москве реклама собираться не будет; "
+                  "«реклама» и «ДРР» в отчётах будут занижены.",
+                  self.name, f" ({reason})" if reason else "")
+
+    def _guard_quota(self):
+        if self._quota_hit or self._usage.get("blocked"):
+            self._quota_hit = True
+            raise PerformanceQuotaError(
+                f"[{self.name}] суточный лимит запросов рекламы исчерпан"
+            )
+        if DAILY_BUDGET and self._usage.get("count", 0) >= DAILY_BUDGET:
+            self._mark_quota_exhausted(
+                f"свой потолок PERF_DAILY_BUDGET={DAILY_BUDGET}, "
+                f"лимит OZON — {OZON_DAILY_LIMIT}")
+            raise PerformanceQuotaError(
+                f"[{self.name}] израсходован суточный бюджет запросов "
+                f"({DAILY_BUDGET})"
+            )
+
+    def requests_left(self):
+        limit = DAILY_BUDGET or OZON_DAILY_LIMIT
+        return max(0, limit - self._usage.get("count", 0))
+
+    # ------------------------------------------------------------ авторизация
     def _auth(self):
         with self._auth_lock:
             self._auth_locked()
@@ -108,6 +277,7 @@ class PerformanceAPI:
     def _auth_locked(self):
         if self._token and time.time() < self._token_exp - 60:
             return
+        self._count_request()
         r = self.session.post(
             BASE_URL + "/api/client/token",
             json={
@@ -127,27 +297,57 @@ class PerformanceAPI:
         self._token_exp = time.time() + int(data.get("expires_in", 1800))
         self.session.headers.update({"Authorization": f"Bearer {self._token}"})
 
+    # --------------------------------------------------------------- запросы
     # Временные отказы повторяются с нарастающей паузой: терять из-за них целую
-    # пачку кампаний (а с ней часть расхода на рекламу) незачем.
+    # пачку кампаний (а с ней часть расхода на рекламу) незачем. А вот
+    # постоянные отказы — суточный лимит и запрет отчёта — повторять нельзя:
+    # каждая попытка тратит запрос из тех же 2000.
     RETRY_CODES = (429, 500, 502, 503, 504)
     RETRIES = 6
+
+    @staticmethod
+    def _is_daily_limit(body):
+        low = body.lower()
+        return ("дневн" in low or "суточн" in low or "daily" in low) and "лимит" in low \
+            or "daily limit" in low
+
+    @staticmethod
+    def _is_forbidden_report(body):
+        low = body.lower()
+        return ("forbidden for the transferred list" in low
+                or "generation of this type of report is forbidden" in low)
 
     def _request(self, method, path, ok_codes, **kw):
         last = None
         for attempt in range(1, self.RETRIES + 1):
+            self._guard_quota()
             self._auth()
+            self._count_request()
             r = self.session.request(method, BASE_URL + path,
                                      timeout=self.timeout, **kw)
             if r.status_code in ok_codes:
                 return r
-            last = f"HTTP {r.status_code}: {r.text[:300]}"
+
+            body = r.text[:300]
+            last = f"HTTP {r.status_code}: {body}"
+
+            # Суточный лимит. Повторы бессмысленны и только жгут остаток.
+            if r.status_code == 429 and self._is_daily_limit(body):
+                self._mark_quota_exhausted("ответ OZON: 429")
+                raise PerformanceQuotaError(f"[{self.name}] {method} {path} {last}")
+
+            # Этот набор кампаний не поддерживает такой отчёт. Ошибка
+            # постоянная: повторять нельзя, надо искать виновных.
+            if r.status_code == 400 and self._is_forbidden_report(body):
+                raise PerformanceForbiddenReport(f"[{self.name}] {method} {path} {last}")
+
             if r.status_code not in self.RETRY_CODES or attempt == self.RETRIES:
                 break
 
             # «Превышен лимит активных запросов» означает, что предыдущий отчёт
             # ещё готовится. Частым опросом делу не поможешь — нужно ждать,
             # пока освободится единственный слот, поэтому пауза длиннее.
-            busy = "активных запросов" in r.text
+            busy = "активных запросов" in body
             pause = min(10 * attempt, 60) if busy else min(3 * attempt, 15)
             log.debug("[%s] %s %s -> %d, повтор через %.0f с",
                       self.name, method, path, r.status_code, pause)
@@ -160,24 +360,82 @@ class PerformanceAPI:
     def _post(self, path, payload):
         return self._request("POST", path, (200, 202), json=payload).json()
 
-    def campaigns(self, only_active=True):
+    # ------------------------------------------------------------- кампании
+    @staticmethod
+    def _state_of(c):
+        s = str(c.get("state") or c.get("status") or "").upper()
+        return s.replace("CAMPAIGN_STATE_", "").strip() or "?"
+
+    @staticmethod
+    def _ended_before(c, date_from):
+        """Кампания завершилась до начала периода — тратить на неё запрос незачем."""
+        raw = c.get("toDate") or c.get("dateTo") or c.get("to_date") or ""
+        end = _norm_date(raw)
+        return bool(end) and len(end) == 10 and end < str(date_from)
+
+    def _mark_forbidden(self, ids):
+        ids = [str(i) for i in ids]
+        with _FILE_LOCK:
+            self._forbidden.update(ids)
+            _write_json(self._forbid_path, {
+                "ids": sorted(self._forbidden),
+                "updated": _msk_date(),
+                "note": "кампании, по которым OZON запрещает отчёт /api/client/statistics",
+            })
+
+    def campaigns(self, date_from=None, date_to=None, only_active=True):
         """
-        GET /api/client/campaign -> список кампаний.
-        Сначала идут активные: если кампаний больше лимита, в отчёт попадут
-        именно работающие, а не архивные.
+        GET /api/client/campaign -> список ID кампаний, годных для отчёта.
+
+        Отсеиваются архивные (именно они дают 400 «report is forbidden»),
+        кампании из чёрного списка и завершившиеся до начала периода.
+        Остановленные и неактивные остаются: они могли тратить бюджет в
+        начале периода.
         """
-        data = self._get("/api/client/campaign").json()
-        items = data.get("list") or data.get("campaigns") or []
-        if not only_active:
-            return items
+        if self._campaigns_cache is None:
+            data = self._get("/api/client/campaign").json()
+            self._campaigns_cache = data.get("list") or data.get("campaigns") or []
+        items = self._campaigns_cache
 
-        def is_active(c):
-            state = str(c.get("state") or c.get("status") or "").upper()
-            return "RUNNING" in state or "ACTIVE" in state
+        by_state = {}
+        for c in items:
+            st = self._state_of(c)
+            by_state[st] = by_state.get(st, 0) + 1
+        if not self._campaigns_logged:
+            self._campaigns_logged = True
+            log.info("[%s] кампаний в кабинете %d (%s)", self.name, len(items),
+                     ", ".join(f"{k}={v}" for k, v in sorted(by_state.items())))
 
-        active = [c for c in items if is_active(c)]
-        return active or items          # если статусы не распознались — берём все
+        kept, dropped_state, dropped_black, dropped_period = [], 0, 0, 0
+        all_ids = []
+        for c in items:
+            cid = str(c.get("id") or c.get("campaignId") or "").strip()
+            if not cid:
+                continue
+            all_ids.append(cid)
+            if cid in self._forbidden:
+                dropped_black += 1
+                continue
+            if only_active and self._state_of(c) in SKIP_STATES:
+                dropped_state += 1
+                continue
+            if date_from and self._ended_before(c, date_from):
+                dropped_period += 1
+                continue
+            kept.append(cid)
 
+        if not kept and all_ids:
+            # Статусы не распознались — лучше собрать лишнее, чем ничего.
+            kept = [i for i in all_ids if i not in self._forbidden]
+            log.warning("[%s] ни одна кампания не прошла фильтр по статусу — "
+                        "беру все %d", self.name, len(kept))
+        elif dropped_state or dropped_black or dropped_period:
+            log.info("[%s] в отчёт пойдут %d кампаний: пропущено %d по статусу, "
+                     "%d из чёрного списка, %d завершились до начала периода",
+                     self.name, len(kept), dropped_state, dropped_black, dropped_period)
+        return kept
+
+    # ------------------------------------------------------------ статистика
     def statistics(self, date_from, date_to, campaign_ids=None, group_by="DATE"):
         """
         Запрашивает статистику и дожидается готовности отчёта.
@@ -185,8 +443,16 @@ class PerformanceAPI:
         отличаться по локали: 'Расход, руб.', 'Клики', 'Показы', и т.п.).
         date_from/date_to: 'YYYY-MM-DD'.
         """
+        if self._quota_hit or self._usage.get("blocked"):
+            log.error("[%s] реклама пропущена: суточный лимит запросов исчерпан",
+                      self.name)
+            return []
+
         if campaign_ids is None:
-            campaign_ids = [str(c.get("id")) for c in self.campaigns() if c.get("id")]
+            campaign_ids = self.campaigns(date_from, date_to)
+        else:
+            campaign_ids = [str(c) for c in campaign_ids
+                            if str(c) not in self._forbidden]
         if not campaign_ids:
             return []
 
@@ -196,47 +462,118 @@ class PerformanceAPI:
                         self.name, len(campaign_ids), MAX_CAMPAIGNS_TOTAL)
             campaign_ids = campaign_ids[:MAX_CAMPAIGNS_TOTAL]
 
-        # OZON не принимает больше 10 кампаний за раз — идём пачками, по одной
-        if len(campaign_ids) > MAX_CAMPAIGNS_PER_REQUEST:
-            chunks = [campaign_ids[i:i + MAX_CAMPAIGNS_PER_REQUEST]
-                      for i in range(0, len(campaign_ids), MAX_CAMPAIGNS_PER_REQUEST)]
-            workers = min(PARALLEL_BATCHES, len(chunks))
-            log.info("[%s] кампаний %d -> %d пачек по %d%s",
-                     self.name, len(campaign_ids), len(chunks),
-                     MAX_CAMPAIGNS_PER_REQUEST,
-                     "" if workers == 1 else f", в {workers} потока(ов)")
+        if len(campaign_ids) <= MAX_CAMPAIGNS_PER_REQUEST:
+            return self._batch_isolating(date_from, date_to, campaign_ids, group_by)
 
-            started = time.monotonic()
-            rows, failed, done = [], 0, 0
+        # OZON не принимает больше 10 кампаний за раз — идём пачками
+        chunks = [campaign_ids[i:i + MAX_CAMPAIGNS_PER_REQUEST]
+                  for i in range(0, len(campaign_ids), MAX_CAMPAIGNS_PER_REQUEST)]
+        workers = min(PARALLEL_BATCHES, len(chunks))
+        log.info("[%s] кампаний %d -> %d пачек по %d%s; запросов сегодня "
+                 "израсходовано %d, остаток %d",
+                 self.name, len(campaign_ids), len(chunks),
+                 MAX_CAMPAIGNS_PER_REQUEST,
+                 "" if workers == 1 else f", в {workers} потока(ов)",
+                 self._usage.get("count", 0), self.requests_left())
+
+        started = time.monotonic()
+        req0 = self._requests_run
+        rows, failed, quota = [], 0, False
+
+        if workers == 1:
+            # Последовательно и без пула: так предупреждение о неудачной пачке
+            # печатается до начала следующей, а не после неё.
+            for n, chunk in enumerate(chunks, 1):
+                try:
+                    rows.extend(self._batch_isolating(
+                        date_from, date_to, chunk, group_by, f"{n}/{len(chunks)}"))
+                except PerformanceQuotaError:
+                    quota = True
+                    log.error("[%s] сбор рекламы прерван на пачке %d из %d: "
+                              "суточный лимит запросов исчерпан",
+                              self.name, n, len(chunks))
+                    break
+                # Ловим любое исключение, а не только своё: сломанный CSV в
+                # одной пачке не повод потерять рекламу по всему магазину.
+                except Exception as e:
+                    failed += 1
+                    log.warning("[%s] пачка %d/%d (кампании %s) пропущена: %s: %s",
+                                self.name, n, len(chunks), ",".join(chunk),
+                                type(e).__name__, e)
+        else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 tasks = {
-                    pool.submit(self._statistics_batch, date_from, date_to,
-                                chunk, group_by,
-                                f"{n}/{len(chunks)}"): (n, chunk)
+                    pool.submit(self._batch_isolating, date_from, date_to,
+                                chunk, group_by, f"{n}/{len(chunks)}"): (n, chunk)
                     for n, chunk in enumerate(chunks, 1)
                 }
                 for task in as_completed(tasks):
                     n, chunk = tasks[task]
-                    done += 1
                     try:
                         rows.extend(task.result())
-                    # Ловим любое исключение, а не только своё: сломанный CSV в
-                    # одной пачке не повод потерять рекламу по всему магазину.
+                    except PerformanceQuotaError:
+                        quota = True
                     except Exception as e:
                         failed += 1
                         log.warning("[%s] пачка %d/%d (кампании %s) пропущена: %s: %s",
                                     self.name, n, len(chunks), ",".join(chunk),
                                     type(e).__name__, e)
 
-            if failed:
-                log.warning("[%s] не собрано пачек: %d из %d — "
-                            "«реклама» и «ДРР» по этим кампаниям будут занижены",
-                            self.name, failed, len(chunks))
-            log.info("[%s] статистика рекламы собрана за %.0f с, строк: %d",
-                     self.name, time.monotonic() - started, len(rows))
-            return rows
+        if failed:
+            log.warning("[%s] не собрано пачек: %d из %d — "
+                        "«реклама» и «ДРР» по этим кампаниям будут занижены",
+                        self.name, failed, len(chunks))
+        if quota:
+            log.warning("[%s] часть пачек не собрана из-за суточного лимита — "
+                        "«реклама» и «ДРР» занижены", self.name)
+        log.info("[%s] статистика рекламы собрана за %.0f с, строк: %d, "
+                 "запросов: %d (за сегодня %d из %d)",
+                 self.name, time.monotonic() - started, len(rows),
+                 self._requests_run - req0, self._usage.get("count", 0),
+                 DAILY_BUDGET or OZON_DAILY_LIMIT)
+        return rows
 
-        return self._statistics_batch(date_from, date_to, campaign_ids, group_by)
+    def _batch_isolating(self, date_from, date_to, chunk, group_by="DATE", label=""):
+        """
+        Пачка с поиском виновных кампаний.
+
+        Если OZON отвечает «отчёт этого типа запрещён для переданного списка
+        кампаний», делим пачку пополам и повторяем: так одна плохая кампания
+        не уносит с собой девять нормальных. Найденные заносятся в чёрный
+        список на диске, и в следующие разы их даже не пробуем.
+        """
+        try:
+            return self._statistics_batch(date_from, date_to, chunk, group_by, label)
+        except PerformanceForbiddenReport as e:
+            if len(chunk) == 1:
+                self._mark_forbidden(chunk)
+                log.warning("[%s] кампания %s не поддерживает этот отчёт — "
+                            "занесена в чёрный список", self.name, chunk[0])
+                return []
+            if not ISOLATE_FORBIDDEN:
+                raise
+            if self._isolate_left <= 0:
+                log.warning("[%s] пачка %s: отчёт запрещён, но лимит на поиск "
+                            "виновных кампаний исчерпан — пропускаю (продолжу "
+                            "в следующий запуск)", self.name, label or "?")
+                return []
+            self._isolate_left -= 1
+            mid = len(chunk) // 2
+            log.info("[%s] пачка %s: отчёт запрещён, делю %d кампаний на %d и %d, "
+                     "чтобы не потерять рабочие",
+                     self.name, label or "?", len(chunk), mid, len(chunk) - mid)
+            out = []
+            for part, suffix in ((chunk[:mid], "a"), (chunk[mid:], "b")):
+                try:
+                    out.extend(self._batch_isolating(
+                        date_from, date_to, part, group_by, f"{label}{suffix}"))
+                except PerformanceQuotaError:
+                    raise
+                except Exception as sub:
+                    log.warning("[%s] пачка %s%s (кампании %s) пропущена: %s: %s",
+                                self.name, label or "?", suffix, ",".join(part),
+                                type(sub).__name__, sub)
+            return out
 
     def _statistics_batch(self, date_from, date_to, campaign_ids,
                           group_by="DATE", label=""):
@@ -252,6 +589,13 @@ class PerformanceAPI:
         }
         log.info("[%s] %sзапрашиваю отчёт по %d кампаниям",
                  self.name, tag, len(campaign_ids))
+
+        # Отсчёт идёт отсюда, а не от получения UUID: в _post может уйти
+        # несколько минут на повторы при «лимите активных запросов», и раньше
+        # это время не попадало в «готово за N с» — в логе стояло «за 7 с»
+        # там, где по часам прошло больше минуты.
+        started = time.monotonic()
+
         resp = self._post("/api/client/statistics", payload)
         uuid = resp.get("UUID") or resp.get("uuid")
         if not uuid:
@@ -259,13 +603,11 @@ class PerformanceAPI:
 
         # Ожидание готовности. Ограничение по времени, а не по числу опросов:
         # когда пачек много, OZON ставит отчёты в очередь и ждать приходится
-        # дольше, чем при одиночном запросе.
-        #
-        # Раз в POLL_NOTICE секунд пишем, что всё ещё ждём: отчёт может
-        # готовиться минуту и дольше, и без отметки процесс выглядит зависшим.
-        started = time.monotonic()
+        # дольше, чем при одиночном запросе. Пауза между опросами растёт —
+        # каждый опрос стоит запроса из суточных 2000.
         deadline = started + REPORT_TIMEOUT
         next_notice = started + POLL_NOTICE
+        pause = POLL_START
         while time.monotonic() < deadline:
             st = self._get(f"/api/client/statistics/{uuid}").json()
             state = (st.get("state") or st.get("status") or "").upper()
@@ -278,7 +620,8 @@ class PerformanceAPI:
                 log.info("[%s] %sотчёт ещё готовится, ждём %.0f с (статус %s)",
                          self.name, tag, now - started, state or "?")
                 next_notice = now + POLL_NOTICE
-            time.sleep(POLL_INTERVAL)
+            time.sleep(min(pause, max(0.0, deadline - time.monotonic())))
+            pause = min(POLL_MAX, pause * POLL_GROWTH)
         else:
             raise PerformanceAPIError(
                 f"[{self.name}] отчёт рекламы не готов за {REPORT_TIMEOUT:.0f} с "
@@ -315,6 +658,7 @@ class PerformanceAPI:
         """
         rows = self.statistics(date_from, date_to, group_by="DATE")
         out = {}
+        dated = True
         for row in rows:
             keys = {(k or "").lower(): (k or "") for k in row}
 
@@ -332,9 +676,20 @@ class PerformanceAPI:
             sku = str(row.get(k_sku) or "").strip()
             if not sku:
                 continue
-            day = _norm_date(row.get(k_date)) if k_date else str(date_from)
+            if k_date:
+                day = _norm_date(row.get(k_date)) or str(date_from)
+            else:
+                # Дат в отчёте нет — весь расход валится на первый день периода.
+                # Нарезать такой результат на подпериоды нельзя.
+                dated = False
+                day = str(date_from)
             out.setdefault(sku, {})
             out[sku][day] = out[sku].get(day, 0.0) + _num(row.get(k_spend))
+
+        self.last_spend_dated = dated
+        if rows and not dated:
+            log.warning("[%s] в отчёте рекламы нет колонки с датой — расход "
+                        "отнесён на %s целиком", self.name, date_from)
         return out
 
     @staticmethod
