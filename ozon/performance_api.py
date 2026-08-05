@@ -55,6 +55,9 @@ PARALLEL_BATCHES = max(1, int(os.environ.get("PERF_PARALLEL", "1")))
 REPORT_TIMEOUT = float(os.environ.get("PERF_REPORT_TIMEOUT", "300"))
 POLL_INTERVAL = float(os.environ.get("PERF_POLL_INTERVAL", "3"))
 
+# Как часто напоминать в лог, что отчёт всё ещё готовится.
+POLL_NOTICE = float(os.environ.get("PERF_POLL_NOTICE", "30"))
+
 
 def _num(x):
     """'1 234,56' -> 1234.56"""
@@ -92,10 +95,10 @@ class PerformanceAPI:
         self.session = requests.Session()
         self._token = None
         self._token_exp = 0
-        # Пачки кампаний идут в несколько потоков через одну сессию. Обновление
-        # токена пишет и в self._token, и в общие заголовки сессии, поэтому
-        # обёрнуто замком: иначе два потока разом полезут за токеном и один
-        # затрёт заголовок другого на полуслове.
+        # Пачки кампаний могут идти в несколько потоков через одну сессию.
+        # Обновление токена пишет и в self._token, и в общие заголовки сессии,
+        # поэтому обёрнуто замком: иначе два потока разом полезут за токеном
+        # и один затрёт заголовок другого на полуслове.
         self._auth_lock = threading.Lock()
 
     def _auth(self):
@@ -208,7 +211,8 @@ class PerformanceAPI:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 tasks = {
                     pool.submit(self._statistics_batch, date_from, date_to,
-                                chunk, group_by): (n, chunk)
+                                chunk, group_by,
+                                f"{n}/{len(chunks)}"): (n, chunk)
                     for n, chunk in enumerate(chunks, 1)
                 }
                 for task in as_completed(tasks):
@@ -216,14 +220,13 @@ class PerformanceAPI:
                     done += 1
                     try:
                         rows.extend(task.result())
-                        # Сбор идёт минутами — без отметок кажется, что всё зависло.
-                        log.info("[%s] пачка %d/%d готова (%.0f с)",
-                                 self.name, done, len(chunks),
-                                 time.monotonic() - started)
-                    except PerformanceAPIError as e:
+                    # Ловим любое исключение, а не только своё: сломанный CSV в
+                    # одной пачке не повод потерять рекламу по всему магазину.
+                    except Exception as e:
                         failed += 1
-                        log.warning("[%s] пачка %d/%d (кампании %s) пропущена: %s",
-                                    self.name, n, len(chunks), ",".join(chunk), e)
+                        log.warning("[%s] пачка %d/%d (кампании %s) пропущена: %s: %s",
+                                    self.name, n, len(chunks), ",".join(chunk),
+                                    type(e).__name__, e)
 
             if failed:
                 log.warning("[%s] не собрано пачек: %d из %d — "
@@ -235,8 +238,10 @@ class PerformanceAPI:
 
         return self._statistics_batch(date_from, date_to, campaign_ids, group_by)
 
-    def _statistics_batch(self, date_from, date_to, campaign_ids, group_by="DATE"):
+    def _statistics_batch(self, date_from, date_to, campaign_ids,
+                          group_by="DATE", label=""):
         """Один отчёт по пачке не больше MAX_CAMPAIGNS_PER_REQUEST кампаний."""
+        tag = f"пачка {label}: " if label else ""
         payload = {
             "campaigns": [str(c) for c in campaign_ids],
             "from": f"{date_from}T00:00:00.000Z",
@@ -245,6 +250,8 @@ class PerformanceAPI:
             "dateTo": date_to,
             "groupBy": group_by,
         }
+        log.info("[%s] %sзапрашиваю отчёт по %d кампаниям",
+                 self.name, tag, len(campaign_ids))
         resp = self._post("/api/client/statistics", payload)
         uuid = resp.get("UUID") or resp.get("uuid")
         if not uuid:
@@ -253,7 +260,12 @@ class PerformanceAPI:
         # Ожидание готовности. Ограничение по времени, а не по числу опросов:
         # когда пачек много, OZON ставит отчёты в очередь и ждать приходится
         # дольше, чем при одиночном запросе.
-        deadline = time.monotonic() + REPORT_TIMEOUT
+        #
+        # Раз в POLL_NOTICE секунд пишем, что всё ещё ждём: отчёт может
+        # готовиться минуту и дольше, и без отметки процесс выглядит зависшим.
+        started = time.monotonic()
+        deadline = started + REPORT_TIMEOUT
+        next_notice = started + POLL_NOTICE
         while time.monotonic() < deadline:
             st = self._get(f"/api/client/statistics/{uuid}").json()
             state = (st.get("state") or st.get("status") or "").upper()
@@ -261,6 +273,11 @@ class PerformanceAPI:
                 break
             if state in ("ERROR", "FAILED"):
                 raise PerformanceAPIError(f"[{self.name}] отчёт рекламы завершился с ошибкой: {st}")
+            now = time.monotonic()
+            if now >= next_notice:
+                log.info("[%s] %sотчёт ещё готовится, ждём %.0f с (статус %s)",
+                         self.name, tag, now - started, state or "?")
+                next_notice = now + POLL_NOTICE
             time.sleep(POLL_INTERVAL)
         else:
             raise PerformanceAPIError(
@@ -271,9 +288,19 @@ class PerformanceAPI:
         # скачивание CSV
         r = self._get("/api/client/statistics/report", params={"UUID": uuid})
         text = r.content.decode("utf-8-sig", errors="replace")
-        # OZON отдаёт CSV с разделителем ';'
-        reader = csv.DictReader(io.StringIO(text), delimiter=";")
-        return [row for row in reader]
+
+        # OZON отдаёт CSV с разделителем ';' и переносами '\r\n'.
+        #
+        # newline="" здесь обязателен. Без него StringIO режет текст только по
+        # '\n', в конце каждой строки остаётся '\r', и csv падает с «new-line
+        # character seen in unquoted field». Именно так весь сбор рекламы и
+        # обвалился на боевом прогоне. С newline="" разбор переносов остаётся
+        # за csv — заодно переживают и многострочные значения в кавычках.
+        reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=";")
+        out = [row for row in reader]
+        log.info("[%s] %sготово за %.0f с, строк %d",
+                 self.name, tag, time.monotonic() - started, len(out))
+        return out
 
     def spend_by_product_day(self, date_from, date_to):
         """
