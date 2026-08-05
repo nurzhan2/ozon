@@ -40,12 +40,16 @@ MAX_CAMPAIGNS_PER_REQUEST = 10
 # укладываться в окно до 8 утра.
 MAX_CAMPAIGNS_TOTAL = int(os.environ.get("PERF_MAX_CAMPAIGNS", "0"))
 
-# Пачки по 10 кампаний идут параллельно: статистика асинхронная (запрос ->
-# ожидание -> скачивание CSV), и почти всё время нить просто спит в ожидании
-# готовности отчёта. При 289 кампаниях это 29 отчётов: последовательно —
-# десятки минут, в 4 потока — минуты. Лимит Seller API (2 запроса в секунду)
-# сюда не относится: это отдельный сервис.
-PARALLEL_BATCHES = max(1, int(os.environ.get("PERF_PARALLEL", "4")))
+# Сколько пачек собирать одновременно.
+#
+# ПО УМОЛЧАНИЮ 1, И МЕНЯТЬ ЭТО НЕ НАДО. Performance API разрешает ровно один
+# активный запрос статистики на аккаунт: при попытке запустить второй он
+# отвечает 429 «Превышен лимит активных запросов (максимум 1)». Проверено на
+# боевом аккаунте — при четырёх потоках отвалились 4 пачки из 12.
+#
+# Параметр оставлен на случай, если OZON когда-нибудь поднимет лимит. Ставить
+# больше 1 сейчас — гарантированно терять часть расхода на рекламу.
+PARALLEL_BATCHES = max(1, int(os.environ.get("PERF_PARALLEL", "1")))
 
 # Сколько ждать готовности одного отчёта и как часто спрашивать статус.
 REPORT_TIMEOUT = float(os.environ.get("PERF_REPORT_TIMEOUT", "300"))
@@ -120,11 +124,10 @@ class PerformanceAPI:
         self._token_exp = time.time() + int(data.get("expires_in", 1800))
         self.session.headers.update({"Authorization": f"Bearer {self._token}"})
 
-    # Пачки идут параллельно, поэтому OZON может ответить 429 или временной
-    # 5xx. Такие ответы повторяются с нарастающей паузой: терять из-за них
-    # целую пачку кампаний (а с ней часть расхода на рекламу) незачем.
+    # Временные отказы повторяются с нарастающей паузой: терять из-за них целую
+    # пачку кампаний (а с ней часть расхода на рекламу) незачем.
     RETRY_CODES = (429, 500, 502, 503, 504)
-    RETRIES = 4
+    RETRIES = 6
 
     def _request(self, method, path, ok_codes, **kw):
         last = None
@@ -137,7 +140,12 @@ class PerformanceAPI:
             last = f"HTTP {r.status_code}: {r.text[:300]}"
             if r.status_code not in self.RETRY_CODES or attempt == self.RETRIES:
                 break
-            pause = min(3 * attempt, 15)
+
+            # «Превышен лимит активных запросов» означает, что предыдущий отчёт
+            # ещё готовится. Частым опросом делу не поможешь — нужно ждать,
+            # пока освободится единственный слот, поэтому пауза длиннее.
+            busy = "активных запросов" in r.text
+            pause = min(10 * attempt, 60) if busy else min(3 * attempt, 15)
             log.debug("[%s] %s %s -> %d, повтор через %.0f с",
                       self.name, method, path, r.status_code, pause)
             time.sleep(pause)
@@ -185,17 +193,18 @@ class PerformanceAPI:
                         self.name, len(campaign_ids), MAX_CAMPAIGNS_TOTAL)
             campaign_ids = campaign_ids[:MAX_CAMPAIGNS_TOTAL]
 
-        # OZON не принимает больше 10 кампаний за раз — идём пачками, параллельно
+        # OZON не принимает больше 10 кампаний за раз — идём пачками, по одной
         if len(campaign_ids) > MAX_CAMPAIGNS_PER_REQUEST:
             chunks = [campaign_ids[i:i + MAX_CAMPAIGNS_PER_REQUEST]
                       for i in range(0, len(campaign_ids), MAX_CAMPAIGNS_PER_REQUEST)]
             workers = min(PARALLEL_BATCHES, len(chunks))
-            log.info("[%s] кампаний %d -> %d пачек по %d, в %d потока(ов)",
+            log.info("[%s] кампаний %d -> %d пачек по %d%s",
                      self.name, len(campaign_ids), len(chunks),
-                     MAX_CAMPAIGNS_PER_REQUEST, workers)
+                     MAX_CAMPAIGNS_PER_REQUEST,
+                     "" if workers == 1 else f", в {workers} потока(ов)")
 
             started = time.monotonic()
-            rows, failed = [], 0
+            rows, failed, done = [], 0, 0
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 tasks = {
                     pool.submit(self._statistics_batch, date_from, date_to,
@@ -204,8 +213,13 @@ class PerformanceAPI:
                 }
                 for task in as_completed(tasks):
                     n, chunk = tasks[task]
+                    done += 1
                     try:
                         rows.extend(task.result())
+                        # Сбор идёт минутами — без отметок кажется, что всё зависло.
+                        log.info("[%s] пачка %d/%d готова (%.0f с)",
+                                 self.name, done, len(chunks),
+                                 time.monotonic() - started)
                     except PerformanceAPIError as e:
                         failed += 1
                         log.warning("[%s] пачка %d/%d (кампании %s) пропущена: %s",
