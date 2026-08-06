@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Офлайн-проверка правок performance_api / collector: сеть подменена."""
-import os, sys, json, time, shutil, logging, tempfile
+import os, sys, csv, json, time, shutil, logging, tempfile
 
 CACHE = tempfile.mkdtemp(prefix="perfcache_")
 os.environ["PERF_CACHE_DIR"] = CACHE
@@ -251,6 +251,40 @@ api.session = FakeSession(campaigns=camps(spec2[:10]))
 rows = api.statistics("2026-08-01", "2026-08-01")
 check("магазин не заперт навсегда — пробуем и собираем", len(rows) == 10, len(rows))
 check("блокировка снята", api._usage.get("blocked") is False, api._usage)
+
+# ------------------------------------ 8. отчёт приходит ZIP-архивом
+print("\n8. Отчёт рекламы приходит ZIP-архивом, а не голым CSV")
+import io as _io, zipfile as _zip
+
+CSV = "sku;Дата;Расход, руб.\r\n4267040923;05.08.2026;1 234,56\r\n" \
+      "4267040923;04.08.2026;1 000,00\r\n1956487415;05.08.2026;500,00\r\n"
+_buf = _io.BytesIO()
+with _zip.ZipFile(_buf, "w") as _z:
+    _z.writestr("33140426_30.07.2026-05.08.2026.csv", CSV.encode("utf-8"))
+ZIPPED = _buf.getvalue()
+
+check("это действительно архив", ZIPPED[:4] == b"PK\x03\x04")
+check("текст достаётся из архива", PA2._report_text(ZIPPED, "Т") == CSV)
+check("голый CSV по-прежнему работает",
+      PA2._report_text(CSV.encode("utf-8-sig"), "Т") == CSV)
+try:
+    PA2._report_text(b"PK\x03\x04" + "мусор".encode("utf-8"), "Т")
+    check("битый архив должен падать понятной ошибкой", False)
+except PA2.PerformanceAPIError as e:
+    check("битый архив падает понятной ошибкой", "архив" in str(e), str(e))
+
+# сквозной путь: архив -> расход по товарам и дням
+_api = PA2.PerformanceAPI.__new__(PA2.PerformanceAPI)
+_api.name, _api.last_spend_dated = "Т", True
+_api.statistics = lambda *a, **k: list(csv.DictReader(
+    _io.StringIO(PA2._report_text(ZIPPED, "Т"), newline=""), delimiter=";"))
+_spend = _api.spend_by_product_day("2026-08-04", "2026-08-05")
+check("товаров разобрано", len(_spend) == 2, _spend)
+check("расход по дням верный",
+      _spend["4267040923"] == {"2026-08-05": 1234.56, "2026-08-04": 1000.0},
+      _spend.get("4267040923"))
+check("запятая как разделитель дробной части понята",
+      _spend["1956487415"]["2026-08-05"] == 500.0, _spend)
 
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 shutil.rmtree(CACHE, ignore_errors=True)

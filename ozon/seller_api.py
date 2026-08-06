@@ -61,13 +61,26 @@ METRICS_REPORT = [
 METRICS_PER_REQUEST = 14
 
 # Метрики, которые OZON объявил устаревшими: запрос с ними отбивается с
-# 400 «deprecated metrics used». position_category («место в поиске»)
-# проверена на боевом аккаунте — отдельным запросом даёт именно этот отказ.
-# Такие метрики не отправляются, но остаются в отчёте с нулём: иначе строка
-# из макета молча исчезла бы. Список пополняется на лету, если OZON выведет
-# из обращения что-то ещё.
+# 400 «deprecated metrics used», причём одна такая метрика уносит весь запрос
+# вместе с живыми. Поэтому они не отправляются, но остаются в отчёте нулями —
+# иначе строка из макета молча исчезла бы. Список пополняется на лету.
+#
+# Проверено поштучно на боевом аккаунте 07.08.2026: из восемнадцати метрик
+# /v1/analytics/data живы ровно две — revenue и ordered_units. Остальные
+# шестнадцать отвечают 400 «deprecated metrics used». Поэтому строки отчётов
+# «показы», «клики», «CTR», «корзина», «% корзины», «отмен» и «место в поиске»
+# заполнить из этого метода нечем: они остаются нулями до тех пор, пока не
+# найдётся метод-замена.
+_DEPRECATED_DEFAULT = (
+    "delivered_units,returns,cancellations,"
+    "hits_view_search,hits_view_pdp,hits_view,"
+    "hits_tocart_search,hits_tocart_pdp,hits_tocart,"
+    "session_view_search,session_view_pdp,session_view,"
+    "conv_tocart_search,conv_tocart_pdp,conv_tocart,"
+    "position_category"
+)
 DEPRECATED_METRICS = {m.strip() for m in os.environ.get(
-    "OZON_DEPRECATED_METRICS", "position_category").split(",") if m.strip()}
+    "OZON_DEPRECATED_METRICS", _DEPRECATED_DEFAULT).split(",") if m.strip()}
 
 
 # ----------------------------------------------------------------------------

@@ -30,6 +30,7 @@
 
 import io
 import os
+import zipfile
 import csv
 import json
 import time
@@ -181,6 +182,38 @@ def _write_json(path, data):
 
 class PerformanceAPIError(Exception):
     pass
+
+
+def _report_text(content, name="", tag=""):
+    """
+    Достаёт текст отчёта из ответа OZON.
+
+    Отчёт по нескольким кампаниям приходит НЕ голым CSV, а ZIP-архивом с
+    файлом внутри (имя вида 33140426_30.07.2026-05.08.2026.csv). Голый разбор
+    архива как текста давал строки из двоичного мусора: колонки с sku и
+    расходом не находились, и «реклама» с «ДРР» во всех отчётах оставались
+    нулями — молча, без единой ошибки в логе.
+
+    Узнаём архив по сигнатуре PK\x03\x04 и распаковываем. Если внутри
+    несколько файлов, берём первый .csv.
+    """
+    if content[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as z:
+                names = z.namelist()
+                csvs = [n for n in names if n.lower().endswith(".csv")] or names
+                if not csvs:
+                    raise PerformanceAPIError(
+                        f"[{name}] {tag}архив отчёта пуст")
+                if len(csvs) > 1:
+                    log.info("[%s] %sв архиве отчёта %d файлов, беру %s",
+                             name, tag, len(csvs), csvs[0])
+                raw = z.read(csvs[0])
+        except zipfile.BadZipFile as e:
+            raise PerformanceAPIError(f"[{name}] {tag}битый архив отчёта: {e}")
+    else:
+        raw = content
+    return raw.decode("utf-8-sig", errors="replace")
 
 
 class PerformanceQuotaError(PerformanceAPIError):
@@ -800,9 +833,9 @@ class PerformanceAPI:
                 f"(кампании {','.join(str(c) for c in campaign_ids)})"
             )
 
-        # скачивание CSV
+        # скачивание отчёта
         r = self._get("/api/client/statistics/report", params={"UUID": uuid})
-        text = r.content.decode("utf-8-sig", errors="replace")
+        text = _report_text(r.content, self.name, tag)
 
         # OZON отдаёт CSV с разделителем ';' и переносами '\r\n'.
         #
