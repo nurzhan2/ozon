@@ -72,9 +72,24 @@ class StoreCollector:
         return {v["offer_id"]: v["name"] for v in offer_map.values() if v.get("offer_id")}
 
     def in_stock_offers(self):
-        """Множество артикулов, у которых есть остаток (>0) и нет метки OUT."""
+        """
+        Множество артикулов, у которых есть остаток (>0) и нет метки OUT.
+
+        Если остатки не пришли вовсе, возвращает None — «не фильтровать».
+        Пустое множество здесь означало бы, что на остатках нет ничего, и
+        отчёты 1-3 выходили бы с одними шапками при живой аналитике. Ровно так
+        и случилось, когда OZON поменял формат ответа по остаткам: молчаливая
+        пустота вместо ошибки. Лучше показать продажи без фильтра по остаткам
+        и громко предупредить, чем отдать пустой отчёт.
+        """
+        stocks = self.stocks()
+        if not stocks:
+            log.warning("[%s] остатков нет ни по одному товару — фильтр «только "
+                        "на остатках» отключён, в отчёт войдут все товары "
+                        "с продажами", self.name)
+            return None
         return {
-            offer_id for offer_id, st in self.stocks().items()
+            offer_id for offer_id, st in stocks.items()
             if st.get("present", 0) > 0 and not P.is_excluded(offer_id, self.exclude_marker)
         }
 

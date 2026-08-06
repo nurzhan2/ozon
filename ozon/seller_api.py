@@ -60,6 +60,15 @@ METRICS_REPORT = [
 
 METRICS_PER_REQUEST = 14
 
+# Метрики, которые OZON объявил устаревшими: запрос с ними отбивается с
+# 400 «deprecated metrics used». position_category («место в поиске»)
+# проверена на боевом аккаунте — отдельным запросом даёт именно этот отказ.
+# Такие метрики не отправляются, но остаются в отчёте с нулём: иначе строка
+# из макета молча исчезла бы. Список пополняется на лету, если OZON выведет
+# из обращения что-то ещё.
+DEPRECATED_METRICS = {m.strip() for m in os.environ.get(
+    "OZON_DEPRECATED_METRICS", "position_category").split(",") if m.strip()}
+
 
 # ----------------------------------------------------------------------------
 # Ограничитель скорости.
@@ -209,6 +218,11 @@ class SellerAPI:
             for name in chunk:
                 if name not in metric_order:
                     metric_order.append(name)
+            # Устаревшие метрики не отправляем: из-за одной такой OZON
+            # отбивает весь запрос, и вместе с ней теряются все остальные.
+            chunk = [m for m in chunk if m not in DEPRECATED_METRICS]
+            if not chunk:
+                continue
             offset = 0
             while True:
                 payload = {
@@ -221,7 +235,26 @@ class SellerAPI:
                     "limit": limit,
                     "offset": offset,
                 }
-                data = self._post("/v1/analytics/data", payload)
+                try:
+                    data = self._post("/v1/analytics/data", payload)
+                except SellerAPIError as e:
+                    if "deprecated metric" not in str(e).lower():
+                        raise
+                    # Кто-то из набора устарел. Находим виновных поштучно —
+                    # один раз за процесс, дальше они уже в списке.
+                    bad = self._find_deprecated(chunk, date_from, date_to, dimension)
+                    if not bad:
+                        raise
+                    DEPRECATED_METRICS.update(bad)
+                    log.warning("[%s] OZON считает метрики устаревшими: %s — "
+                                "исключаю, в отчёте они будут нулями",
+                                self.name, ", ".join(sorted(bad)))
+                    chunk = [m for m in chunk if m not in bad]
+                    if not chunk:
+                        break
+                    payload["metrics"] = chunk
+                    payload["sort"] = [{"key": chunk[0], "order": "DESC"}]
+                    data = self._post("/v1/analytics/data", payload)
                 rows = (data.get("result") or {}).get("data") or []
                 for row in rows:
                     dims = row.get("dimensions", [])
@@ -239,6 +272,21 @@ class SellerAPI:
                 rec.setdefault(name, 0)
             result.append(rec)
         return result, metric_order
+
+    def _find_deprecated(self, metrics, date_from, date_to, dimension):
+        """Проверяет метрики по одной и возвращает те, что OZON отверг."""
+        bad = set()
+        for m in metrics:
+            try:
+                self._post("/v1/analytics/data", {
+                    "date_from": date_from, "date_to": date_to,
+                    "metrics": [m], "dimension": list(dimension), "filters": [],
+                    "sort": [{"key": m, "order": "DESC"}], "limit": 1, "offset": 0,
+                })
+            except SellerAPIError as e:
+                if "deprecated metric" in str(e).lower():
+                    bad.add(m)
+        return bad
 
     # ---------------- Товары ----------------
     def product_list(self, limit=1000):
@@ -297,28 +345,65 @@ class SellerAPI:
         POST /v4/product/info/stocks -> остатки по товарам.
         Возвращает dict: offer_id -> {"present": int, "reserved": int, "product_id": id}
         present — доступно к продаже (сумма по складам), reserved — зарезервировано.
+
+        ОСТОРОЖНО С ФОРМАТОМ ОТВЕТА. OZON перевёл этот метод на постраничность
+        через cursor и убрал обёртку result: раньше приходило
+        {"result": {"items": [...], "last_id": "..."}}, теперь
+        {"items": [...], "cursor": "...", "total": N}. Старый разбор молча
+        получал пустой список — не ошибку, а именно пустоту. А дальше пустые
+        остатки означали, что НИ ОДИН товар не «на остатках», и отчёты 1-3
+        выходили с одними шапками при живой аналитике. Поэтому здесь
+        принимаются оба формата, а пустой ответ пишется в лог.
         """
         result = {}
-        last_id = ""
+        cursor = ""
+        # None — ещё не знаем, какой ключ постраничности понимает аккаунт
+        use_cursor = None
         while True:
-            payload = {"filter": {"visibility": "ALL"}, "last_id": last_id, "limit": limit}
-            data = self._post("/v4/product/info/stocks", payload)
-            res = data.get("result") or {}
+            payload = {"filter": {"visibility": "ALL"}, "limit": limit}
+            if use_cursor is False:
+                payload["last_id"] = cursor
+            else:
+                payload["cursor"] = cursor
+            try:
+                data = self._post("/v4/product/info/stocks", payload)
+            except SellerAPIError as e:
+                # Аккаунт на старом формате: cursor он не понимает.
+                if use_cursor is None and getattr(e, "status", None) == 400:
+                    log.debug("[%s] остатки: cursor не принят (%s), пробую last_id",
+                              self.name, str(e)[:120])
+                    use_cursor = False
+                    continue
+                raise
+            if use_cursor is None:
+                use_cursor = True
+
+            res = data.get("result") if isinstance(data.get("result"), dict) else data
             items = res.get("items") or []
             for it in items:
                 offer_id = it.get("offer_id", "")
+                if not offer_id:
+                    continue
                 present = reserved = 0
                 for st in (it.get("stocks") or []):
-                    present += int(st.get("present", 0) or 0)
-                    reserved += int(st.get("reserved", 0) or 0)
-                result[offer_id] = {
-                    "present": present,
-                    "reserved": reserved,
-                    "product_id": it.get("product_id"),
-                }
-            last_id = res.get("last_id") or ""
-            if not items or not last_id or len(items) < limit:
+                    # в разных версиях поле называется по-разному
+                    present += int(st.get("present")
+                                   or st.get("available_stock_count") or 0)
+                    reserved += int(st.get("reserved")
+                                    or st.get("reserved_stock_count") or 0)
+                rec = result.setdefault(offer_id, {"present": 0, "reserved": 0,
+                                                   "product_id": it.get("product_id")})
+                rec["present"] += present
+                rec["reserved"] += reserved
+            nxt = res.get("cursor") or res.get("last_id") or ""
+            if not items or not nxt or nxt == cursor or len(items) < limit:
                 break
+            cursor = nxt
+
+        if not result:
+            log.warning("[%s] остатки пришли пустыми — все товары будут считаться "
+                        "«не на остатках». Проверьте /v4/product/info/stocks",
+                        self.name)
         return result
 
     # ---------------- Остатки по кластерам ----------------

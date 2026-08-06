@@ -162,7 +162,9 @@ def filter_products(products, stocks, marker="OUT", only_in_stock=True):
         reserved = st.get("reserved", 0)
         rec["stock_present"] = present
         rec["stock_reserved"] = reserved
-        if only_in_stock and present <= 0:
+        # stocks пустой — значит остатки не пришли вовсе; фильтровать по ним
+        # нельзя, иначе отчёт молча обнулится (см. in_stock_offers).
+        if only_in_stock and stocks and present <= 0:
             continue
         out[key] = rec
     return out
