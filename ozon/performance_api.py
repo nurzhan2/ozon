@@ -184,36 +184,59 @@ class PerformanceAPIError(Exception):
     pass
 
 
-def _report_text(content, name="", tag=""):
-    """
-    Достаёт текст отчёта из ответа OZON.
+# По каким словам узнаём строку заголовков внутри CSV. Перед ней OZON иногда
+# кладёт строку с названием кампании — её надо пропустить, иначе заголовками
+# станет название, а данные потеряются.
+_HEADER_HINTS = ("sku", "артикул", "дата", "date", "расход", "spend", "ozon id")
 
-    Отчёт по нескольким кампаниям приходит НЕ голым CSV, а ZIP-архивом с
-    файлом внутри (имя вида 33140426_30.07.2026-05.08.2026.csv). Голый разбор
-    архива как текста давал строки из двоичного мусора: колонки с sku и
-    расходом не находились, и «реклама» с «ДРР» во всех отчётах оставались
-    нулями — молча, без единой ошибки в логе.
 
-    Узнаём архив по сигнатуре PK\x03\x04 и распаковываем. Если внутри
-    несколько файлов, берём первый .csv.
+def _report_parts(content, name="", tag=""):
     """
-    if content[:4] == b"PK\x03\x04":
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                names = z.namelist()
-                csvs = [n for n in names if n.lower().endswith(".csv")] or names
-                if not csvs:
-                    raise PerformanceAPIError(
-                        f"[{name}] {tag}архив отчёта пуст")
-                if len(csvs) > 1:
-                    log.info("[%s] %sв архиве отчёта %d файлов, беру %s",
-                             name, tag, len(csvs), csvs[0])
-                raw = z.read(csvs[0])
-        except zipfile.BadZipFile as e:
-            raise PerformanceAPIError(f"[{name}] {tag}битый архив отчёта: {e}")
-    else:
-        raw = content
-    return raw.decode("utf-8-sig", errors="replace")
+    Достаёт из ответа OZON все CSV отчёта.
+
+    Отчёт по пачке кампаний приходит ZIP-архивом, и внутри лежит ОТДЕЛЬНЫЙ
+    файл на каждую кампанию: на пачку из десяти — десять csv с именами вида
+    33016625_01.08.2026-05.08.2026.csv. Брать только первый нельзя: так
+    теряется девять десятых расхода, причём незаметно — строки-то есть.
+
+    Возвращает список текстов (по одному на файл). Голый CSV без архива —
+    список из одного элемента.
+    """
+    if content[:4] != b"PK\x03\x04":
+        return [content.decode("utf-8-sig", errors="replace")]
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
+            names = [n for n in z.namelist() if not n.endswith("/")]
+            csvs = [n for n in names if n.lower().endswith(".csv")] or names
+            if not csvs:
+                raise PerformanceAPIError(f"[{name}] {tag}архив отчёта пуст")
+            return [z.read(n).decode("utf-8-sig", errors="replace") for n in csvs]
+    except zipfile.BadZipFile as e:
+        raise PerformanceAPIError(f"[{name}] {tag}битый архив отчёта: {e}")
+
+
+def _rows_from_csv(text):
+    """
+    Разбирает один CSV отчёта в список словарей.
+
+    newline="" обязателен: без него StringIO режет текст только по '\n',
+    в конце строк остаётся '\r', и csv падает с «new-line character seen in
+    unquoted field». Именно так весь сбор рекламы и обвалился на первом
+    боевом прогоне.
+    """
+    lines = text.splitlines(keepends=True)
+    # ищем строку заголовков: до неё может стоять название кампании
+    head = 0
+    for i, line in enumerate(lines[:5]):
+        low = line.lower()
+        if ";" in line and any(h in low for h in _HEADER_HINTS):
+            head = i
+            break
+    body = "".join(lines[head:])
+    if not body.strip():
+        return []
+    reader = csv.DictReader(io.StringIO(body, newline=""), delimiter=";")
+    return [row for row in reader]
 
 
 class PerformanceQuotaError(PerformanceAPIError):
@@ -835,17 +858,16 @@ class PerformanceAPI:
 
         # скачивание отчёта
         r = self._get("/api/client/statistics/report", params={"UUID": uuid})
-        text = _report_text(r.content, self.name, tag)
+        parts = _report_parts(r.content, self.name, tag)
 
-        # OZON отдаёт CSV с разделителем ';' и переносами '\r\n'.
-        #
-        # newline="" здесь обязателен. Без него StringIO режет текст только по
-        # '\n', в конце каждой строки остаётся '\r', и csv падает с «new-line
-        # character seen in unquoted field». Именно так весь сбор рекламы и
-        # обвалился на боевом прогоне. С newline="" разбор переносов остаётся
-        # за csv — заодно переживают и многострочные значения в кавычках.
-        reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=";")
-        out = [row for row in reader]
+        # Каждый файл архива — отдельная кампания со своей шапкой,
+        # поэтому разбираем их по одному и складываем.
+        out = []
+        for part in parts:
+            out.extend(_rows_from_csv(part))
+        if len(parts) > 1:
+            log.debug("[%s] %sфайлов в архиве: %d, строк суммарно: %d",
+                      self.name, tag, len(parts), len(out))
         log.info("[%s] %sготово за %.0f с, строк %d",
                  self.name, tag, time.monotonic() - started, len(out))
         return out
