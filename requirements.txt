@@ -2,3 +2,6 @@ requests>=2.31.0
 openpyxl>=3.1.2
 google-api-python-client>=2.100.0
 google-auth>=2.23.0
+# На Windows у Python нет системной базы часовых поясов, и
+# ZoneInfo("Europe/Moscow") падает. На Linux пакет лишний, но безвредный.
+tzdata>=2024.1

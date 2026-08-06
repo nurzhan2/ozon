@@ -120,5 +120,69 @@ except SellerAPIError as e:
     check("в тексте видно оба адреса",
           "analytics/stocks" in str(e) and "manage/stocks" in str(e), str(e))
 
+print("\n7. Жёсткий лимит /v1/analytics/stocks: больше попыток и длиннее паузы")
+import ozon.seller_api as S
+
+
+class Resp:
+    def __init__(self, code, data=None):
+        self.status_code = code
+        self._data = data or {}
+        self.text = "rate limit per second" if code == 429 else ""
+
+    def json(self):
+        return self._data
+
+
+def api_with(responses):
+    a = S.SellerAPI.__new__(S.SellerAPI)
+    a.name, a.max_retries, a.timeout = "ТЕСТ", 4, 60
+    a.session = type("S", (), {})()
+    a.calls = []
+
+    def post(url, json=None, timeout=None):
+        a.calls.append(url)
+        return responses[min(len(a.calls) - 1, len(responses) - 1)]
+
+    a.session.post = post
+    return a
+
+
+slept = []
+real_sleep = S.time.sleep
+S.time.sleep = lambda x: slept.append(x)
+try:
+    # шесть отказов подряд, затем успех: обычному адресу попыток не хватит,
+    # «медленному» — хватит
+    seq = [Resp(429)] * 6 + [Resp(200, {"items": []})]
+    a = api_with(seq)
+    try:
+        a._post("/v1/product/list", {})
+        check("обычный адрес сдаётся на 4 попытках", False)
+    except S.SellerAPIError:
+        check("обычный адрес сдаётся на 4 попытках", len(a.calls) == 4, len(a.calls))
+
+    slept.clear()
+    a = api_with(seq)
+    out = a._post("/v1/analytics/stocks", {})
+    check("медленный адрес дотерпел до успеха", out == {"items": []}, out)
+    check("и потратил 7 попыток", len(a.calls) == 7, len(a.calls))
+    # в slept попадают и паузы ограничителя частоты — берём только паузы
+    # между попытками (они целые)
+    waits = [x for x in slept if isinstance(x, int)]
+    check("паузы длиннее прежних 5-20 с",
+          waits[:4] == [15, 30, 45, 60], waits[:4])
+
+    # шаг между вызовами выдерживается
+    S.time.sleep = lambda x: slept.append(x)
+    slept.clear()
+    S._LAST_SLOW_CALL.clear()
+    S._throttle("/v1/analytics/stocks")
+    S._throttle("/v1/analytics/stocks")
+    check("между двумя вызовами выдержан шаг",
+          any(x >= 3.5 for x in slept), slept)
+finally:
+    S.time.sleep = real_sleep
+
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 sys.exit(0 if ok else 1)

@@ -73,14 +73,35 @@ _LAST_CALL = [0.0]
 MIN_INTERVAL = float(os.environ.get("OZON_MIN_INTERVAL", "0.6"))   # сек между запросами
 
 
-def _throttle():
+# Отдельные методы аналитики держат лимит куда жёстче общих двух запросов
+# в секунду и отвечают 429 «You have reached request rate limit per second»
+# даже на одиночный вызов, если предыдущий был недавно. На боевом прогоне так
+# отвалились кластерные остатки «Штучки»: четыре попытки с паузами 5-20 с
+# закончились ничем, и отчёт 4 по этому магазину собрался по складам —
+# без «в поставках в пути» и среднесуточных продаж.
+#
+# Для таких адресов держим свой, более редкий шаг и более длинные паузы
+# при отказе.
+SLOW_ENDPOINTS = {
+    "/v1/analytics/stocks": float(os.environ.get("OZON_STOCKS_INTERVAL", "4")),
+}
+_LAST_SLOW_CALL = {}
+
+
+def _throttle(path=None):
     """Выдерживает паузу так, чтобы не превышать разрешённую частоту."""
     with _RATE_LOCK:
         now = time.monotonic()
         wait = MIN_INTERVAL - (now - _LAST_CALL[0])
+        slow = SLOW_ENDPOINTS.get(path)
+        if slow:
+            since = now - _LAST_SLOW_CALL.get(path, 0.0)
+            wait = max(wait, slow - since)
         if wait > 0:
             time.sleep(wait)
         _LAST_CALL[0] = time.monotonic()
+        if slow:
+            _LAST_SLOW_CALL[path] = _LAST_CALL[0]
 
 
 class SellerAPIError(Exception):
@@ -111,15 +132,16 @@ class SellerAPI:
         url = BASE_URL + path
         last_err = None
         network_only = True   # ни одного ответа от OZON так и не получили
-        for attempt in range(1, self.max_retries + 1):
-            _throttle()
+        tries = self.max_retries + (3 if path in SLOW_ENDPOINTS else 0)
+        for attempt in range(1, tries + 1):
+            _throttle(path)
             try:
                 r = self.session.post(url, json=payload, timeout=self.timeout)
             except requests.RequestException as e:
                 last_err = e
                 log.warning("[%s] %s сетевая ошибка (%s), попытка %d/%d",
-                            self.name, path, e, attempt, self.max_retries)
-                if attempt < self.max_retries:
+                            self.name, path, e, attempt, tries)
+                if attempt < tries:
                     time.sleep(min(2 ** attempt, 15))
                 continue
 
@@ -130,12 +152,18 @@ class SellerAPI:
             # 429 / 5xx — повторяем с паузой
             if r.status_code in (429, 500, 502, 503, 504):
                 # 429 — упёрлись в лимит частоты: ждём заметно дольше
-                wait = min(5 * attempt, 30) if r.status_code == 429 else min(2 ** attempt, 30)
+                if r.status_code == 429:
+                    # У «медленных» адресов лимит жёстче: паузы длиннее,
+                    # иначе попытки кончаются раньше, чем OZON нас отпускает.
+                    wait = (min(15 * attempt, 90) if path in SLOW_ENDPOINTS
+                            else min(5 * attempt, 30))
+                else:
+                    wait = min(2 ** attempt, 30)
                 log.warning("[%s] %s HTTP %d, пауза %ds (попытка %d/%d)",
-                            self.name, path, r.status_code, wait, attempt, self.max_retries)
+                            self.name, path, r.status_code, wait, attempt, tries)
                 last_err = SellerAPIError(f"HTTP {r.status_code}: {r.text[:300]}",
                                           status=r.status_code)
-                if attempt < self.max_retries:
+                if attempt < tries:
                     time.sleep(wait)
                 continue
 
