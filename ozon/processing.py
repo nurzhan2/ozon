@@ -119,6 +119,131 @@ def merge_ad_spend(daily, ad_spend, sku_map):
             d["ad_spend"] = spend_days.get(day, 0.0)
 
 
+def _index_by_offer(data, sku_map):
+    """
+    Приводит {ключ: {...}} к артикулам: ключом может быть sku или артикул.
+    Та же логика, что в merge_ad_spend, вынесена отдельно.
+    """
+    out = {}
+    for key, val in (data or {}).items():
+        offer = key
+        try:
+            info = sku_map.get(int(key))
+            if info:
+                offer = info["offer_id"]
+        except (TypeError, ValueError):
+            pass
+        out.setdefault(offer, {}).update(val if isinstance(val, dict) else {})
+        if not isinstance(val, dict):
+            out[offer] = val
+    return out
+
+
+def _rec_keys(rec):
+    """Под какими ключами товар может быть в чужих данных."""
+    return [k for k in (rec.get("offer_id"), str(rec.get("sku") or "")) if k]
+
+
+def merge_queries(daily, queries_by_day, sku_map):
+    """
+    Подмешивает данные /v1/analytics/product-queries:
+      views    -> hits_view          («показы»: уникальные посетители)
+      position -> position_category  («место в поиске»)
+
+    Метрики того же смысла из /v1/analytics/data доступны только с Premium
+    Plus, а этот метод работает с обычным Premium.
+    """
+    by_offer = {}
+    for day, items in (queries_by_day or {}).items():
+        for sku, rec in (items or {}).items():
+            offer = rec.get("offer_id") or ""
+            if not offer:
+                info = None
+                try:
+                    info = sku_map.get(int(sku))
+                except (TypeError, ValueError):
+                    pass
+                offer = info["offer_id"] if info else sku
+            for key in {offer, str(sku)}:
+                by_offer.setdefault(key, {})[day] = rec
+
+    for rec in daily.values():
+        src = {}
+        for k in _rec_keys(rec):
+            if k in by_offer:
+                src = by_offer[k]
+                break
+        for day, d in rec["days"].items():
+            q = src.get(day)
+            if not q:
+                continue
+            if q.get("views"):
+                d["hits_view"] = q["views"]
+            if q.get("position"):
+                d["position_category"] = q["position"]
+
+
+def merge_ad_traffic(daily, ad_stats, sku_map):
+    """
+    Показы и клики из рекламного отчёта: ad_views / ad_clicks, а также
+    session_view («клики») — другого источника кликов без Premium Plus нет.
+    ВАЖНО: это трафик только по рекламируемым товарам, не весь.
+    """
+    by_offer = {}
+    for key, days in (ad_stats or {}).items():
+        offer = key
+        try:
+            info = sku_map.get(int(key))
+            if info:
+                offer = info["offer_id"]
+        except (TypeError, ValueError):
+            pass
+        tgt = by_offer.setdefault(offer, {})
+        for day, v in days.items():
+            acc = tgt.setdefault(day, {"views": 0.0, "clicks": 0.0})
+            acc["views"] += v.get("views", 0.0)
+            acc["clicks"] += v.get("clicks", 0.0)
+
+    for rec in daily.values():
+        src = {}
+        for k in _rec_keys(rec):
+            if k in by_offer:
+                src = by_offer[k]
+                break
+        for day, d in rec["days"].items():
+            v = src.get(day) or {}
+            d["ad_views"] = v.get("views", 0.0)
+            d["ad_clicks"] = v.get("clicks", 0.0)
+            # «клики» в отчёте — рекламные: store-wide кликов без Premium Plus нет
+            d["session_view"] = v.get("clicks", 0.0)
+
+
+def merge_cancels(daily, cancels, sku_map):
+    """Отменённые штуки из отправлений -> метрика cancellations."""
+    by_offer = {}
+    for key, days in (cancels or {}).items():
+        offer = key
+        try:
+            info = sku_map.get(int(key))
+            if info:
+                offer = info["offer_id"]
+        except (TypeError, ValueError):
+            pass
+        tgt = by_offer.setdefault(offer, {})
+        for day, qty in days.items():
+            tgt[day] = tgt.get(day, 0) + qty
+
+    for rec in daily.values():
+        src = {}
+        for k in _rec_keys(rec):
+            if k in by_offer:
+                src = by_offer[k]
+                break
+        for day, d in rec["days"].items():
+            if src.get(day):
+                d["cancellations"] = src[day]
+
+
 def sum_days(rec, days, metric):
     """Сумма метрики по списку дней в подневной записи."""
     total = 0

@@ -15,6 +15,21 @@ from . import dates as D
 log = logging.getLogger("ozon.collector")
 
 
+def _days_between(date_from, date_to):
+    """Список дней 'YYYY-MM-DD' включительно."""
+    from datetime import date as _date, timedelta as _td
+    try:
+        a = _date.fromisoformat(str(date_from)[:10])
+        b = _date.fromisoformat(str(date_to)[:10])
+    except ValueError:
+        return []
+    out, cur = [], a
+    while cur <= b:
+        out.append(cur.isoformat())
+        cur += _td(days=1)
+    return out
+
+
 def _slice_days(data, date_from, date_to):
     """Вырезает из {товар: {день: расход}} только дни внутри периода."""
     out = {}
@@ -53,6 +68,11 @@ class StoreCollector:
         # раза в минуту, а отчёты 1 и 3 просят один и тот же период — без кэша
         # это лишний дорогой запрос на каждый магазин.
         self._daily_cache = {}
+        # Запросы товаров (показы и позиция) — по дням, потому что отчёты
+        # показывают их подневно. Кэш нужен: отчёты 1 и 3 берут один период.
+        self._queries_cache = {}
+        # Отмены из отправлений — по периодам.
+        self._cancel_cache = {}
 
     # ---------------- справочники ----------------
     def maps(self):
@@ -143,9 +163,22 @@ class StoreCollector:
         allowed = self.in_stock_offers() if only_in_stock else None
         result = P.rows_to_daily(rows, sku_map, order, allowed, self.exclude_marker)
         # подмешиваем расход рекламы
-        ads = self.ad_spend(df, dt)
+        ads = self.ad_stats(df, dt)
         if ads:
-            P.merge_ad_spend(result, ads, sku_map)
+            P.merge_ad_spend(result, {k: {d: v.get("spend", 0.0)
+                                          for d, v in days.items()}
+                                      for k, days in ads.items()}, sku_map)
+            # показы и клики по рекламе — единственный доступный источник
+            # кликов без подписки Premium Plus
+            P.merge_ad_traffic(result, ads, sku_map)
+        # показы и место в поиске из «запросов моих товаров» (обычный Premium)
+        q = self.queries_by_day(df, dt)
+        if q:
+            P.merge_queries(result, q, sku_map)
+        # отмены из отправлений — точные, без подписки
+        c = self.cancels(df, dt)
+        if c:
+            P.merge_cancels(result, c, sku_map)
         self._daily_cache[key] = (result, order)
         return result, order
 
@@ -165,10 +198,60 @@ class StoreCollector:
                 P.add_kpis(rec)
         return products
 
+    # ---------------- замена метрик Premium Plus ----------------
+    def queries_by_day(self, date_from, date_to):
+        """
+        {день: {sku: {views, position, ...}}} из /v1/analytics/product-queries.
+
+        Метод доступен с обычным Premium, поэтому им закрываются «показы»
+        (уникальные посетители, увидевшие товар) и «место в поиске», которых
+        в /v1/analytics/data нет без Premium Plus. Запрашиваем по дню, потому
+        что отчёты показывают их подневно; каждый день кэшируется.
+
+        Сегодняшний день OZON не считает («расчёт идёт 1-2 дня») — пропускаем.
+        """
+        sku_map, _ = self.maps()
+        skus = list(sku_map)
+        if not skus:
+            return {}
+        today = D.d(D.today(getattr(self.cfg, "tz", "Europe/Moscow"))
+                    if hasattr(self.cfg, "tz") else D.today())
+        out = {}
+        for day in _days_between(date_from, date_to):
+            if day >= today:
+                continue
+            if day not in self._queries_cache:
+                try:
+                    self._queries_cache[day] = self.seller.product_queries(
+                        day, day, skus)
+                except SellerAPIError as e:
+                    log.warning("[%s] запросы товаров за %s недоступны: %s",
+                                self.name, day, str(e)[:200])
+                    self._queries_cache[day] = {}
+            out[day] = self._queries_cache[day]
+        return out
+
+    def cancels(self, date_from, date_to):
+        """{ключ_товара: {день: отменено_шт}} из отправлений FBO и FBS."""
+        key = (date_from, date_to)
+        if key not in self._cancel_cache:
+            try:
+                self._cancel_cache[key] = self.seller.cancelled_units(
+                    date_from, date_to)
+            except SellerAPIError as e:
+                log.warning("[%s] отмены недоступны: %s", self.name, str(e)[:200])
+                self._cancel_cache[key] = {}
+        return self._cancel_cache[key]
+
     # ---------------- реклама ----------------
     def ad_spend(self, date_from, date_to):
+        """{ключ_товара: {день: расход}} — только деньги, для «рекламы» и ДРР."""
+        return {sku: {day: v.get("spend", 0.0) for day, v in days.items()}
+                for sku, days in self.ad_stats(date_from, date_to).items()}
+
+    def ad_stats(self, date_from, date_to):
         """
-        {ключ_товара: {день: расход}} за запрошенный период.
+        {ключ_товара: {день: {spend, views, clicks}}} за запрошенный период.
 
         Ходит в Performance API не больше одного раза за запуск: отчёт идёт с
         группировкой по дням, поэтому уже собранный широкий период режется по
@@ -195,7 +278,7 @@ class StoreCollector:
         need_from = min(df, have[0]) if have else df
         need_to = max(dt, have[1]) if have else dt
         try:
-            self._ad_data = self.perf.spend_by_product_day(need_from, need_to)
+            self._ad_data = self.perf.stats_by_product_day(need_from, need_to)
             self._ad_dated = getattr(self.perf, "last_spend_dated", True)
             self._ad_range = (need_from, need_to)
         except Exception as e:

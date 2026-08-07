@@ -872,16 +872,16 @@ class PerformanceAPI:
                  self.name, tag, time.monotonic() - started, len(out))
         return out
 
-    def spend_by_product_day(self, date_from, date_to):
+    def stats_by_product_day(self, date_from, date_to):
         """
-        Расход рекламы в разрезе ТОВАР × ДЕНЬ — нужен для колонок «реклама» и «ДРР».
+        Реклама в разрезе ТОВАР × ДЕНЬ: расход, показы и клики.
 
-        Запрашивает статистику с группировкой по дням и разбирает CSV: ищет
-        колонки с артикулом/SKU/названием, датой и расходом. Названия колонок у
-        OZON зависят от типа кампании, поэтому поиск идёт по подстрокам.
+        Показы и клики берутся отсюда не от хорошей жизни: в Seller API они
+        доступны только с подпиской Premium Plus. В рекламном отчёте они есть
+        всегда — правда, это трафик ТОЛЬКО по рекламируемым товарам, а не весь.
+        В отчётах такие числа подписаны как рекламные.
 
-        Возвращает: {ключ_товара: {'YYYY-MM-DD': расход_руб}}
-        где ключ_товара — sku (строкой) либо артикул, что нашлось в отчёте.
+        Возвращает: {ключ_товара: {'YYYY-MM-DD': {'spend':.., 'views':.., 'clicks':..}}}
         """
         rows = self.statistics(date_from, date_to, group_by="DATE")
         out = {}
@@ -898,6 +898,10 @@ class PerformanceAPI:
             k_sku = find("sku", "артикул", "ozon id")
             k_date = find("дата", "date", "день")
             k_spend = find("расход", "spend", "cost", "затрат")
+            # «показы» отличаем от «показов в поиске» не строго: берём первое
+            # совпадение, в отчёте OZON колонка одна.
+            k_views = find("показ", "view", "impression")
+            k_clicks = find("клик", "click")
             if not (k_sku and k_spend):
                 continue
             sku = str(row.get(k_sku) or "").strip()
@@ -906,18 +910,30 @@ class PerformanceAPI:
             if k_date:
                 day = _norm_date(row.get(k_date)) or str(date_from)
             else:
-                # Дат в отчёте нет — весь расход валится на первый день периода.
-                # Нарезать такой результат на подпериоды нельзя.
                 dated = False
                 day = str(date_from)
-            out.setdefault(sku, {})
-            out[sku][day] = out[sku].get(day, 0.0) + _num(row.get(k_spend))
+            rec = out.setdefault(sku, {}).setdefault(
+                day, {"spend": 0.0, "views": 0.0, "clicks": 0.0})
+            rec["spend"] += _num(row.get(k_spend))
+            if k_views:
+                rec["views"] += _num(row.get(k_views))
+            if k_clicks:
+                rec["clicks"] += _num(row.get(k_clicks))
 
         self.last_spend_dated = dated
         if rows and not dated:
             log.warning("[%s] в отчёте рекламы нет колонки с датой — расход "
                         "отнесён на %s целиком", self.name, date_from)
         return out
+
+    def spend_by_product_day(self, date_from, date_to):
+        """
+        Только расход: {ключ_товара: {'YYYY-MM-DD': расход_руб}}.
+        Оставлено как есть — этим пользуются колонки «реклама» и «ДРР».
+        """
+        stats = self.stats_by_product_day(date_from, date_to)
+        return {sku: {day: v["spend"] for day, v in days.items()}
+                for sku, days in stats.items()}
 
     @staticmethod
     def aggregate_totals(rows):

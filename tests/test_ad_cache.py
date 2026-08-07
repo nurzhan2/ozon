@@ -19,14 +19,15 @@ class FakePerf:
         self.sweeps = []
         self.last_spend_dated = True
 
-    def spend_by_product_day(self, df, dt):
+    def stats_by_product_day(self, df, dt):
         from datetime import date, timedelta
         self.sweeps.append((df, dt))
         out, cur = {}, date.fromisoformat(df)
         end = date.fromisoformat(dt)
         while cur <= end:
             for sku in ("SKU1", "SKU2"):
-                out.setdefault(sku, {})[cur.isoformat()] = 10.0
+                out.setdefault(sku, {})[cur.isoformat()] = {
+                    "spend": 10.0, "views": 100.0, "clicks": 5.0}
             cur += timedelta(days=1)
         return out
 
@@ -63,7 +64,7 @@ check("и он не пустой", later["SKU1"] == {"2026-08-04": 10.0}, later)
 
 print("\n3. Реклама отвалилась — не долбим API повторно")
 class Broken(FakePerf):
-    def spend_by_product_day(self, df, dt):
+    def stats_by_product_day(self, df, dt):
         self.sweeps.append((df, dt))
         raise RuntimeError("429 дневной лимит")
 
@@ -75,10 +76,10 @@ check("повторного похода нет", len(c.perf.sweeps) == 1, c.per
 
 print("\n4. Отчёт без колонки дат не режется по дням")
 class NoDates(FakePerf):
-    def spend_by_product_day(self, df, dt):
+    def stats_by_product_day(self, df, dt):
         self.sweeps.append((df, dt))
         self.last_spend_dated = False
-        return {"SKU1": {df: 120.0}}
+        return {"SKU1": {df: {"spend": 120.0, "views": 0.0, "clicks": 0.0}}}
 
 c = make(); c.perf = NoDates()
 full = c.ad_spend("2026-08-01", "2026-08-04")

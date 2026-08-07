@@ -346,9 +346,14 @@ def build_intraday(collectors, cfg, snapshots_dir=None):
 # CTR — два знака (1,85%), % корзины и ДРР — один (20,5% / 14,7%),
 # место в поиске — целое число (62, 72, 54).
 QUALITY_ROWS = [
+    # «показы» — уникальные посетители из «запросов моих товаров»
+    # (/v1/analytics/product-queries, доступен с обычным Premium).
+    # «клики» и «CTR» — рекламные: кликов по всему магазину без Premium Plus
+    # взять неоткуда, поэтому подписаны честно и считаются от рекламной пары
+    # показы/клики, чтобы процент был осмысленным.
     ("показы", "hits_view", X.FMT_PLAIN_INT),
-    ("клики", "session_view", X.FMT_PLAIN_INT),
-    ("CTR", "ctr", X.FMT_PCT2),
+    ("клики (реклама)", "session_view", X.FMT_PLAIN_INT),
+    ("CTR (реклама)", "ctr", X.FMT_PCT2),
     ("корзина", "hits_tocart", X.FMT_PLAIN_INT),
     ("% корзины", "cart_rate", X.FMT_PCT),
     ("купили (без отмен)", "bought", X.FMT_PLAIN_INT),
@@ -364,6 +369,10 @@ def _quality_day_values(d):
     """Расчёт производных показателей за один день по образцу."""
     views = d.get("hits_view", 0) or 0
     clicks = d.get("session_view", 0) or 0
+    # CTR считаем от рекламной пары: показы приходят из поиска, клики — из
+    # рекламы, и делить одно на другое было бы бессмыслицей.
+    ad_views = d.get("ad_views", 0) or 0
+    ad_clicks = d.get("ad_clicks", 0) or 0
     cart = d.get("hits_tocart", 0) or 0
     ordered = d.get("ordered_units", 0) or 0
     cancel = d.get("cancellations", 0) or 0
@@ -372,7 +381,7 @@ def _quality_day_values(d):
     return {
         "hits_view": int(round(views)),
         "session_view": int(round(clicks)),
-        "ctr": _safe_div(clicks, views),
+        "ctr": _safe_div(ad_clicks, ad_views),
         "hits_tocart": int(round(cart)),
         "cart_rate": _safe_div(cart, clicks),
         "bought": int(round(max(ordered - cancel, 0))),
@@ -419,7 +428,8 @@ def _quality_store_totals(items, day_keys):
     (складывать позиции в поиске бессмысленно — получилась бы сумма мест).
     """
     ADDITIVE = ("revenue", "ordered_units", "cancellations", "hits_view",
-                "session_view", "hits_tocart", "ad_spend")
+                "session_view", "hits_tocart", "ad_spend",
+                "ad_views", "ad_clicks")
     out = {}
     for k in day_keys:
         acc = {m: 0 for m in ADDITIVE}

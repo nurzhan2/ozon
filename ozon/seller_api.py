@@ -144,6 +144,20 @@ def _throttle(path=None):
             _LAST_SLOW_CALL[path] = _LAST_CALL[0]
 
 
+def _day_of(posting):
+    """День отправления в виде 'YYYY-MM-DD' — по первой найденной дате."""
+    for k in ("in_process_at", "created_at", "shipment_date", "order_date"):
+        v = posting.get(k)
+        if isinstance(v, str) and len(v) >= 10:
+            return v[:10]
+    an = posting.get("analytics_data") or {}
+    for k in ("client_delivery_date_begin", "delivery_date_begin"):
+        v = an.get(k)
+        if isinstance(v, str) and len(v) >= 10:
+            return v[:10]
+    return ""
+
+
 class SellerAPIError(Exception):
     """Ошибка Seller API. network=True — до OZON не достучались (сеть/прокси)."""
 
@@ -435,6 +449,118 @@ class SellerAPI:
             log.warning("[%s] остатки пришли пустыми — все товары будут считаться "
                         "«не на остатках». Проверьте /v4/product/info/stocks",
                         self.name)
+        return result
+
+
+    # ---------------- Запросы товаров (замена части метрик Premium Plus) ----
+    # /v1/analytics/data отдаёт показы, клики, корзину и позицию только
+    # с подпиской Premium Plus. А вот /v1/analytics/product-queries по
+    # документации доступен с ОБЫЧНЫМ Premium: «Полная аналитика доступна
+    # с подпиской Premium, Premium Plus или Premium Pro».
+    #
+    # Оттуда берём:
+    #   unique_view_users  -> «показы» (уникальные пользователи, увидевшие товар)
+    #   position           -> «место в поиске»
+    #   view_conversion    -> конверсия из показа
+    #
+    # Это не буквально те же величины, что в Premium Plus: там показы —
+    # события, здесь — уникальные пользователи. Но это настоящие данные OZON
+    # по тем же товарам, а не оценка.
+    QUERIES_SKU_CHUNK = 1000
+
+    def product_queries(self, date_from, date_to, skus, page_size=1000):
+        """
+        POST /v1/analytics/product-queries -> {sku(str): {...}}
+
+        date_from/date_to — 'YYYY-MM-DD'. Текущую дату OZON не считает
+        («расчёт происходит в течение 1-2 дней»), вызывающий код её не просит.
+        """
+        uniq = [s for s in dict.fromkeys(str(x) for x in skus if x)]
+        if not uniq:
+            return {}
+        out = {}
+        for i in range(0, len(uniq), self.QUERIES_SKU_CHUNK):
+            chunk = uniq[i:i + self.QUERIES_SKU_CHUNK]
+            page = 0
+            while True:
+                payload = {
+                    "date_from": f"{date_from}T00:00:00Z",
+                    "date_to": f"{date_to}T23:59:59Z",
+                    "skus": chunk,
+                    "page": page,
+                    "page_size": page_size,
+                    "sort_by": "BY_SEARCHES",
+                    "sort_dir": "DESCENDING",
+                }
+                data = self._post("/v1/analytics/product-queries", payload)
+                items = data.get("items") or []
+                for it in items:
+                    sku = str(it.get("sku") or "")
+                    if not sku:
+                        continue
+                    out[sku] = {
+                        "offer_id": it.get("offer_id", ""),
+                        "name": it.get("name", ""),
+                        "position": _f(it.get("position")),
+                        "views": _i(it.get("unique_view_users")),
+                        "searches": _i(it.get("unique_search_users")),
+                        "view_conversion": _f(it.get("view_conversion")),
+                        "gmv": _f(it.get("gmv")),
+                    }
+                page += 1
+                if page >= int(data.get("page_count") or 1) or not items:
+                    break
+        return out
+
+    # ---------------- Отмены из отправлений ----------------
+    # cancellations в /v1/analytics/data тоже под Premium Plus, но отменённые
+    # отправления доступны всем: берём их из FBO и FBS и считаем штуки по
+    # товарам и дням. Это не оценка, а первичные данные.
+    CANCELLED_STATUSES = ("cancelled",)
+
+    def cancelled_units(self, date_from, date_to, limit=100):
+        """
+        Отменённые штуки по товарам и дням: {offer_id или sku: {день: шт}}.
+        Ходит в /v3/posting/fbo/list и /v4/posting/fbs/list.
+        """
+        result = {}
+        for path in ("/v3/posting/fbo/list", "/v4/posting/fbs/list"):
+            cursor = ""
+            guard = 0
+            while True:
+                guard += 1
+                if guard > 200:          # страховка от бесконечной страницы
+                    log.warning("[%s] %s: слишком много страниц, обрываю",
+                                self.name, path)
+                    break
+                payload = {
+                    "cursor": cursor,
+                    "limit": limit,
+                    "sort_dir": "ASC",
+                    "filter": {
+                        "since": f"{date_from}T00:00:00.000Z",
+                        "to": f"{date_to}T23:59:59.999Z",
+                        "statuses": list(self.CANCELLED_STATUSES),
+                    },
+                }
+                try:
+                    data = self._post(path, payload)
+                except SellerAPIError as e:
+                    log.warning("[%s] отмены из %s недоступны: %s",
+                                self.name, path, str(e)[:200])
+                    break
+                for post in (data.get("postings") or []):
+                    day = _day_of(post)
+                    for pr in (post.get("products") or []):
+                        key = pr.get("offer_id") or str(pr.get("sku") or "")
+                        if not key:
+                            continue
+                        qty = _i(pr.get("quantity")) or 1
+                        result.setdefault(key, {})
+                        result[key][day] = result[key].get(day, 0) + qty
+                cursor = data.get("cursor") or ""
+                if not data.get("has_next") or not cursor:
+                    break
         return result
 
     # ---------------- Остатки по кластерам ----------------
