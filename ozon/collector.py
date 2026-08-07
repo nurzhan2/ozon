@@ -49,6 +49,10 @@ class StoreCollector:
         self._ad_data = {}
         self._ad_range = None       # ('YYYY-MM-DD', 'YYYY-MM-DD') или None
         self._ad_dated = True
+        # Подневная аналитика по периодам. /v1/analytics/data разрешён не чаще
+        # раза в минуту, а отчёты 1 и 3 просят один и тот же период — без кэша
+        # это лишний дорогой запрос на каждый магазин.
+        self._daily_cache = {}
 
     # ---------------- справочники ----------------
     def maps(self):
@@ -129,6 +133,10 @@ class StoreCollector:
         """
         df = D.d(date_from) if hasattr(date_from, "strftime") else date_from
         dt = D.d(date_to) if hasattr(date_to, "strftime") else date_to
+        key = (df, dt, bool(only_in_stock))
+        if key in self._daily_cache:
+            return self._daily_cache[key]
+
         sku_map, _ = self.maps()
         rows, order = self.seller.analytics_data(df, dt, dimension=("sku", "day"),
                                                  metrics=METRICS_REPORT)
@@ -138,6 +146,7 @@ class StoreCollector:
         ads = self.ad_spend(df, dt)
         if ads:
             P.merge_ad_spend(result, ads, sku_map)
+        self._daily_cache[key] = (result, order)
         return result, order
 
     def products_for_period(self, date_from, date_to, only_in_stock=True,

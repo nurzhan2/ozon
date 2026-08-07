@@ -60,18 +60,28 @@ METRICS_REPORT = [
 
 METRICS_PER_REQUEST = 14
 
-# Метрики, которые OZON объявил устаревшими: запрос с ними отбивается с
-# 400 «deprecated metrics used», причём одна такая метрика уносит весь запрос
-# вместе с живыми. Поэтому они не отправляются, но остаются в отчёте нулями —
-# иначе строка из макета молча исчезла бы. Список пополняется на лету.
+# Метрики, ТРЕБУЮЩИЕ ПОДПИСКИ Premium Plus.
 #
-# Проверено поштучно на боевом аккаунте 07.08.2026: из восемнадцати метрик
-# /v1/analytics/data живы ровно две — revenue и ordered_units. Остальные
-# шестнадцать отвечают 400 «deprecated metrics used». Поэтому строки отчётов
-# «показы», «клики», «CTR», «корзина», «% корзины», «отмен» и «место в поиске»
-# заполнить из этого метода нечем: они остаются нулями до тех пор, пока не
-# найдётся метод-замена.
-_DEPRECATED_DEFAULT = (
+# Из документации Ozon Seller API, метод /v1/analytics/data:
+#   «Метрики, доступные всем продавцам: revenue — заказано на сумму,
+#    ordered_units — заказано товаров. Метрики, доступные только продавцам
+#    с подпиской Premium Plus: hits_view_search, hits_view_pdp, hits_view,
+#    hits_tocart_search, hits_tocart_pdp, hits_tocart, session_view_search,
+#    session_view_pdp, session_view, conv_tocart_search, conv_tocart_pdp,
+#    conv_tocart, returns, cancellations, delivered_units, position_category.»
+#
+# То есть дело не в устаревании: обычный Premium не подходит, нужен именно
+# Premium Plus (или Premium Pro). А отвечает OZON при этом сбивающим с толку
+# «400 deprecated metrics used» — из-за этой формулировки причину и искали
+# так долго.
+#
+# Такие метрики не отправляются, но остаются в отчётах нулями, чтобы строки
+# макета не исчезли. Одна недоступная метрика в запросе роняет весь запрос
+# вместе с живыми, поэтому фильтр обязателен.
+#
+# Появится Premium Plus — поставьте OZON_PREMIUM_PLUS=1, и всё заполнится
+# без правок кода.
+_PREMIUM_PLUS_METRICS = (
     "delivered_units,returns,cancellations,"
     "hits_view_search,hits_view_pdp,hits_view,"
     "hits_tocart_search,hits_tocart_pdp,hits_tocart,"
@@ -79,8 +89,11 @@ _DEPRECATED_DEFAULT = (
     "conv_tocart_search,conv_tocart_pdp,conv_tocart,"
     "position_category"
 )
+HAS_PREMIUM_PLUS = os.environ.get("OZON_PREMIUM_PLUS", "0").strip().lower() in (
+    "1", "true", "yes", "да")
 DEPRECATED_METRICS = {m.strip() for m in os.environ.get(
-    "OZON_DEPRECATED_METRICS", _DEPRECATED_DEFAULT).split(",") if m.strip()}
+    "OZON_DEPRECATED_METRICS",
+    "" if HAS_PREMIUM_PLUS else _PREMIUM_PLUS_METRICS).split(",") if m.strip()}
 
 
 # ----------------------------------------------------------------------------
@@ -106,6 +119,11 @@ MIN_INTERVAL = float(os.environ.get("OZON_MIN_INTERVAL", "0.6"))   # сек ме
 # при отказе.
 SLOW_ENDPOINTS = {
     "/v1/analytics/stocks": float(os.environ.get("OZON_STOCKS_INTERVAL", "4")),
+    # Документация: «Метод можно использовать не больше 1 раза в минуту».
+    # Отсюда все 429 на аналитике в боевых логах. Строгие 60 секунд превратили
+    # бы пакет из пяти магазинов в полчаса ожидания, поэтому по умолчанию шаг
+    # мягче, а лимит добирается повторами. Если 429 мешают — поднимите.
+    "/v1/analytics/data": float(os.environ.get("OZON_ANALYTICS_INTERVAL", "12")),
 }
 _LAST_SLOW_CALL = {}
 
