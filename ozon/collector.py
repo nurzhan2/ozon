@@ -225,8 +225,10 @@ class StoreCollector:
                     self._queries_cache[day] = self.seller.product_queries(
                         day, day, skus)
                 except SellerAPIError as e:
+                    # 200 символов обрезали ответ OZON ровно на том месте, где
+                    # начиналась причина отказа: «desc = There is n...».
                     log.warning("[%s] запросы товаров за %s недоступны: %s",
-                                self.name, day, str(e)[:200])
+                                self.name, day, str(e)[:600])
                     self._queries_cache[day] = {}
             out[day] = self._queries_cache[day]
         return out
