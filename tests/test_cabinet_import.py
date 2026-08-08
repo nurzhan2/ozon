@@ -183,5 +183,59 @@ check("сказано про выгрузку из кабинета",
 check("и про Premium Plus как второй путь",
       any("Premium Plus" in t for t in _texts), _texts)
 
+print("\n14. Нет данных за день — пусто, а не ноль")
+day_full = {"hits_view": 900, "session_view": 40, "ad_views": 500,
+            "ad_clicks": 20, "hits_tocart": 30, "revenue": 1000, "ad_spend": 100}
+day_none = {"hits_view": 0, "session_view": 40, "ad_views": 500,
+            "ad_clicks": 20, "revenue": 1000, "ad_spend": 100}
+
+v = R._quality_day_values(day_none, has_views=False, has_cart=False)
+check("показы пустые, а не нулевые", v["hits_view"] is None, v["hits_view"])
+check("место в поиске тоже", v["position_category"] is None)
+check("корзина пустая", v["hits_tocart"] is None)
+check("% корзины пустой, а не 0%", v["cart_rate"] is None)
+check("оборот и реклама остались числами",
+      v["revenue"] == 1000 and v["ad_spend"] == 100, v)
+check("CTR по рекламе считается и без показов", v["ctr"] == 20 / 500, v["ctr"])
+
+v = R._quality_day_values(day_full, has_views=True, has_cart=True)
+check("когда данные есть — обычные числа",
+      v["hits_view"] == 900 and v["hits_tocart"] == 30, v)
+
+print("\n15. Итоги строк не спотыкаются о пустые дни")
+vals = {"d1": R._quality_day_values(day_full, has_views=True, has_cart=True),
+        "d2": R._quality_day_values(day_none, has_views=False, has_cart=False)}
+keys = ["d1", "d2"]
+check("итог показов = только известные дни",
+      R._quality_row_total("hits_view", vals, keys) == 900,
+      R._quality_row_total("hits_view", vals, keys))
+check("итог корзины считает известный день",
+      R._quality_row_total("hits_tocart", vals, keys) == 30,
+      R._quality_row_total("hits_tocart", vals, keys))
+check("итог места в поиске не падает",
+      R._quality_row_total("position_category", vals, keys) is not None)
+
+vals_none = {"d": R._quality_day_values(day_none, has_views=False, has_cart=False)}
+check("все дни пустые — итог тоже пустой, а не ноль",
+      R._quality_row_total("hits_view", vals_none, ["d"]) is None,
+      R._quality_row_total("hits_view", vals_none, ["d"]))
+check("и у корзины",
+      R._quality_row_total("hits_tocart", vals_none, ["d"]) is None)
+check("и у % корзины",
+      R._quality_row_total("cart_rate", vals_none, ["d"]) is None)
+check("и у места в поиске",
+      R._quality_row_total("position_category", vals_none, ["d"]) is None)
+
+print("\n16. Свод по магазину уважает те же признаки")
+items = [{"days": {"2026-08-05": {"hits_view": 100, "revenue": 10},
+                   "2026-08-06": {"hits_view": 0, "revenue": 10}}}]
+tot = R._quality_store_totals(items, ["2026-08-05", "2026-08-06"], False,
+                              views_days={"2026-08-05"}, cart_days=set())
+check("день с данными — число", tot["2026-08-05"]["hits_view"] == 100)
+check("день без данных — пусто", tot["2026-08-06"]["hits_view"] is None)
+check("сноска считает такую строку пустой только если пусты ВСЕ дни",
+      "hits_view" not in R._quality_empty_keys(tot, ["2026-08-05", "2026-08-06"]),
+      R._quality_empty_keys(tot, ["2026-08-05", "2026-08-06"]))
+
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 sys.exit(0 if ok else 1)

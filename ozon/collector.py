@@ -74,6 +74,11 @@ class StoreCollector:
         self._queries_cache = {}
         self._cabinet = None          # выгрузка кабинета, читается лениво
         self.cabinet_filled = set()   # какие метрики она реально закрыла
+        # Дни, за которые источник вообще что-то отдал. Нужны отчёту, чтобы
+        # отличить «ноль показов» от «данных ещё нет»: OZON считает показы
+        # с задержкой в день-два, и на свежей колонке ноль был бы враньём.
+        self.days_with_views = set()
+        self.days_with_cart = set()
         # взводится после двух отказов product-queries подряд, см. queries_by_day
         self._queries_off = False
         # Отмены из отправлений — по периодам.
@@ -180,6 +185,7 @@ class StoreCollector:
         q = self.queries_by_day(df, dt)
         if q:
             P.merge_queries(result, q, sku_map)
+            self.days_with_views |= {d for d, items in q.items() if items}
         # отмены из отправлений — точные, без подписки
         c = self.cancels(df, dt)
         if c:
@@ -189,6 +195,10 @@ class StoreCollector:
         cab = self.cabinet_data()
         if cab:
             self.cabinet_filled = P.merge_cabinet(result, cab, sku_map)
+            cab_days = {day for days in cab.values() for day in days}
+            self.days_with_views |= cab_days
+            if "hits_tocart" in self.cabinet_filled:
+                self.days_with_cart |= cab_days
         self._daily_cache[key] = (result, order)
         return result, order
 

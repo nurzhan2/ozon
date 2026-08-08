@@ -378,7 +378,7 @@ def _quality_rows_for(filled):
             for label, key, fmt in QUALITY_ROWS]
 
 
-def _quality_day_values(d, unified=False):
+def _quality_day_values(d, unified=False, has_views=True, has_cart=True):
     """
     Расчёт производных показателей за один день по образцу.
 
@@ -386,6 +386,12 @@ def _quality_day_values(d, unified=False):
     кабинета), тогда CTR считается по ним. Иначе показы из поиска, а клики
     только рекламные, и делить одно на другое бессмысленно: CTR берётся по
     рекламной паре, а строка подписана «(реклама)».
+
+    has_views / has_cart = False — за этот день источник данных не отдал
+    НИЧЕГО. Тогда в клетке пусто, а не ноль. Разница принципиальная: OZON
+    считает показы с задержкой в день-два, и на свежей колонке ноль читается
+    как «товар никто не видел» — при том, что рядом в той же колонке стоят
+    клики и оборот. Пустая клетка говорит правду: данных ещё нет.
     """
     views = d.get("hits_view", 0) or 0
     clicks = d.get("session_view", 0) or 0
@@ -399,19 +405,20 @@ def _quality_day_values(d, unified=False):
     revenue = d.get("revenue", 0) or 0
     spend = d.get("ad_spend", 0) or 0
     return {
-        "hits_view": int(round(views)),
+        "hits_view": int(round(views)) if has_views else None,
         "session_view": int(round(clicks)),
         # рекламная пара нужна дальше, чтобы итог строки CTR считался тем же
         # способом, что и дни, и колонка «Итого» сходилась с колонками дней
         "ad_views": int(round(ad_views)),
         "ad_clicks": int(round(ad_clicks)),
-        "ctr": (_safe_div(clicks, views) if unified
+        "ctr": ((_safe_div(clicks, views) if has_views else None) if unified
                 else _safe_div(ad_clicks, ad_views)),
-        "hits_tocart": int(round(cart)),
-        "cart_rate": _safe_div(cart, clicks),
+        "hits_tocart": int(round(cart)) if has_cart else None,
+        "cart_rate": _safe_div(cart, clicks) if has_cart else None,
         "bought": int(round(max(ordered - cancel, 0))),
         "cancellations": int(round(cancel)),
-        "position_category": int(round(d.get("position_category", 0) or 0)),
+        "position_category": (int(round(d.get("position_category", 0) or 0))
+                              if has_views else None),
         "revenue": round(revenue),
         "ad_spend": round(spend),
         "drr": _safe_div(spend, revenue),
@@ -511,7 +518,8 @@ def _quality_write_block(ws, r, title, days, vals_by_day, day_keys, with_total,
     return r + 2
 
 
-def _quality_store_totals(items, day_keys, unified=False):
+def _quality_store_totals(items, day_keys, unified=False,
+                          views_days=None, cart_days=None):
     """
     Свод по магазину на каждый день — блок «по аналитике».
     Аддитивные метрики складываются, «место в поиске» усредняется по товарам
@@ -532,7 +540,10 @@ def _quality_store_totals(items, day_keys, unified=False):
             if pos:
                 positions.append(pos)
         acc["position_category"] = (sum(positions) / len(positions)) if positions else 0
-        out[k] = _quality_day_values(acc, unified)
+        out[k] = _quality_day_values(
+            acc, unified,
+            has_views=(views_days is None or k in views_days),
+            has_cart=(cart_days is None or k in cart_days))
     return out
 
 
@@ -565,11 +576,21 @@ def build_quality(collectors, cfg):
         filled = getattr(colr, "cabinet_filled", set()) or set()
         unified = "session_view" in filled
         rows_def = _quality_rows_for(filled)
+        # За какие дни источники вообще ответили. Дни вне этих множеств
+        # выводятся пустыми, а не нулями.
+        v_days = getattr(colr, "days_with_views", set()) or set()
+        c_days = getattr(colr, "days_with_cart", set()) or set()
+
+        def _vals(day_dict, k):
+            return _quality_day_values(day_dict, unified,
+                                       has_views=k in v_days,
+                                       has_cart=k in c_days)
 
         # --- сводный блок по магазину ---
         empty_keys = []
         if items:
-            store_totals = _quality_store_totals(items, day_keys, unified)
+            store_totals = _quality_store_totals(items, day_keys, unified,
+                                                 v_days, c_days)
             empty_keys = _quality_empty_keys(store_totals, day_keys)
             r = _quality_write_block(ws, r, "по аналитике", days,
                                      store_totals, day_keys, with_total,
@@ -577,8 +598,7 @@ def build_quality(collectors, cfg):
 
         # --- блок на каждый товар ---
         for rec in items:
-            vals_by_day = {k: _quality_day_values(rec["days"].get(k, {}), unified)
-                           for k in day_keys}
+            vals_by_day = {k: _vals(rec["days"].get(k, {}), k) for k in day_keys}
             if not any(v["hits_view"] or v["revenue"] for v in vals_by_day.values()):
                 continue
             r = _quality_write_block(ws, r, rec["name"] or rec["offer_id"], days,
@@ -604,19 +624,29 @@ def _quality_row_total(key, vals_by_day, day_keys, unified=False):
     vals = [vals_by_day[k] for k in day_keys]
     if key in ("hits_view", "session_view", "hits_tocart", "bought",
                "cancellations", "revenue", "ad_spend"):
-        return round(sum(v[key] for v in vals))
+        known = [v[key] for v in vals if v[key] is not None]
+        # все дни пустые — итог тоже пустой, а не бодрый ноль
+        return round(sum(known)) if known else None
     if key == "ctr":
         # итог считается тем же способом, что и дни, иначе строка не сойдётся
         if unified:
-            return _safe_div(sum(v["session_view"] for v in vals),
-                             sum(v["hits_view"] for v in vals))
+            views = [v["hits_view"] for v in vals if v["hits_view"] is not None]
+            if not views:
+                return None
+            return _safe_div(sum(v["session_view"] or 0 for v in vals),
+                             sum(views))
         return _safe_div(sum(v.get("ad_clicks", 0) for v in vals),
                          sum(v.get("ad_views", 0) for v in vals))
     if key == "cart_rate":
-        return _safe_div(sum(v["hits_tocart"] for v in vals), sum(v["session_view"] for v in vals))
+        cart = [v["hits_tocart"] for v in vals if v["hits_tocart"] is not None]
+        if not cart:
+            return None
+        return _safe_div(sum(cart), sum(v["session_view"] or 0 for v in vals))
     if key == "drr":
         return _safe_div(sum(v["ad_spend"] for v in vals), sum(v["revenue"] for v in vals))
     if key == "position_category":
+        if all(v[key] is None for v in vals):
+            return None
         nz = [v[key] for v in vals if v[key]]
         return round(sum(nz) / len(nz), 1) if nz else 0
     return 0
