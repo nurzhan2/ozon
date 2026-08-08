@@ -69,14 +69,14 @@ check("две строки за день сложились",
       out3["ART-1"]["2026-08-05"]["views"] == 150.0, out3["ART-1"])
 check("строка «Итого» не стала товаром", "Итого" not in out3, list(out3))
 
-print("\n4. Выгрузка без разбивки по дням отвергается внятно")
+print("\n4. Ни колонки с датой, ни даты в имени — внятный отказ")
 try:
     CAB.parse_rows([["Артикул", "Показы", "В корзину"],
                     ["ART-1", "100", "5"]], "без_дат.xlsx")
     check("должно было подняться исключение", False)
 except CAB.CabinetImportError as e:
-    check("сказано, что нужна разбивка по дням",
-          "ПО ДНЯМ" in str(e), str(e)[:120])
+    check("сказано назвать файл датой",
+          "именем" in str(e) or "имени файла" in str(e), str(e)[:160])
 
 print("\n5. Файл без артикула и без sku тоже отвергается")
 try:
@@ -288,6 +288,65 @@ both = [["Дата", "Артикул", "Уникальные посетител�
         ["09.08.2026", "ART-B", "1000", "30%", "777"]]
 rec = CAB.parse_rows(both, "обе.xlsx")["ART-B"]["2026-08-09"]
 check("взята абсолютная, а не 1000x0.3", rec["tocart"] == 777, rec["tocart"])
+
+print("\n21. День берётся из имени файла")
+for name, want in [("2026-08-08.xlsx", "2026-08-08"),
+                   ("08.08.2026.csv", "2026-08-08"),
+                   ("20260808.xlsx", "2026-08-08"),
+                   ("ШТУЧКА_08.08.2026.xlsx", "2026-08-08"),
+                   ("отчёт (1).xlsx", ""),
+                   ("2026-13-45.xlsx", "")]:
+    check(f"«{name}» -> {want or 'даты нет'}",
+          CAB.day_from_name(name) == want, CAB.day_from_name(name))
+
+print("\n22. Файл без колонки даты разбирается по имени")
+no_date = [["Артикул", "Уникальные посетители, всего",
+            "Уникальные посетители с просмотром карточки товара",
+            "Конверсия в корзину из карточки товара", "Позиция в поиске и каталоге"],
+           ["ART-1", "1000", "200", "30%", "12,5"]]
+import io as _io
+from openpyxl import Workbook as _W
+_wb = _W(); _ws2 = _wb.active
+for r in no_date:
+    _ws2.append(r)
+_buf = _io.BytesIO(); _wb.save(_buf)
+out = CAB.parse_file(_buf.getvalue(), "2026-08-08.xlsx")
+check("день взят из имени", list(out["ART-1"]) == ["2026-08-08"], out)
+check("корзина посчитана", abs(out["ART-1"]["2026-08-08"]["tocart"] - 60) < 0.01,
+      out["ART-1"]["2026-08-08"]["tocart"])
+
+print("\n23. Колонка с датой сильнее имени файла")
+with_date = [["Дата", "Артикул", "Показы"], ["2026-07-01", "ART-1", "5"]]
+out = CAB.parse_rows(with_date, "2026-08-08.xlsx", default_day="2026-08-08")
+check("взята дата из строки, а не из имени",
+      list(out["ART-1"]) == ["2026-07-01"], out)
+
+print("\n24. Папка с файлами по дням собирается в один период")
+import os as _os, shutil as _sh, time as _t
+_folder = "/tmp/_cabtest/import/ТЕСТ"
+_sh.rmtree("/tmp/_cabtest", ignore_errors=True)
+_os.makedirs(_folder)
+for _i, _d in enumerate(["2026-08-05", "2026-08-06", "2026-08-07"]):
+    _wb = _W(); _w = _wb.active
+    _w.append(["Артикул", "Уникальные посетители, всего", "В корзину"])
+    _w.append(["ART-1", 100 + _i, 10 + _i])
+    _wb.save(_os.path.join(_folder, f"{_d}.xlsx"))
+    _t.sleep(0.02)
+res = CAB.load_local("ТЕСТ", "/tmp/_cabtest")
+check("собраны все три дня",
+      sorted(res["ART-1"]) == ["2026-08-05", "2026-08-06", "2026-08-07"],
+      sorted(res.get("ART-1", {})))
+check("числа не перепутались между днями",
+      res["ART-1"]["2026-08-07"]["sessions"] == 102,
+      res["ART-1"]["2026-08-07"])
+
+# битый файл не должен утаскивать за собой остальные
+_wb = _W(); _wb.active.append(["ничего", "полезного"])
+_wb.save(_os.path.join(_folder, "мусор.xlsx"))
+res = CAB.load_local("ТЕСТ", "/tmp/_cabtest")
+check("нечитаемый файл пропущен, остальные разобраны",
+      len(res["ART-1"]) == 3, sorted(res.get("ART-1", {})))
+_sh.rmtree("/tmp/_cabtest", ignore_errors=True)
 
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 sys.exit(0 if ok else 1)

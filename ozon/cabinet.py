@@ -169,6 +169,36 @@ def _day(v):
     return ""
 
 
+_NAME_DATE = (
+    re.compile(r"(20\d{2})[-_.](\d{2})[-_.](\d{2})"),      # 2026-08-08
+    re.compile(r"(?<!\d)(\d{2})[-_.](\d{2})[-_.](20\d{2})"),  # 08.08.2026
+    re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)"),      # 20260808
+)
+
+
+def day_from_name(name):
+    """
+    Дата из имени файла: '2026-08-08.xlsx', '08.08.2026.xlsx', '20260808.xlsx'.
+
+    Нужна потому, что конструктор отчётов в кабинете НЕ умеет разрез по дням:
+    в настройке группировок есть только товары, бренды и категории. Значит
+    один файл может описывать только один день, и день этот приходится
+    брать из имени — больше его в файле негде взять.
+    """
+    base = os.path.basename(str(name or ""))
+    for i, rx in enumerate(_NAME_DATE):
+        m = rx.search(base)
+        if not m:
+            continue
+        a, b, c = m.groups()
+        y, mo, d = (a, b, c) if len(a) == 4 else (c, b, a)
+        try:
+            return datetime(int(y), int(mo), int(d)).date().isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
 def _rows_from_csv(data):
     text = data.decode("utf-8-sig", errors="replace")
     sample = text[:4000]
@@ -183,35 +213,42 @@ def _rows_from_xlsx(data):
     return [list(r) for r in ws.iter_rows(values_only=True)]
 
 
-def _find_header(rows):
+def _find_header(rows, default_day=""):
     """
     Шапка не всегда в первой строке: выгрузки OZON любят пару строк
-    с названием отчёта и периодом сверху. Ищем первую строку, в которой
-    нашлись и дата, и хоть одна нужная величина.
+    с названием отчёта и периодом сверху. Ищем первую строку, где нашлась
+    хоть одна нужная величина, а вместе с ней дата — либо колонкой, либо
+    заранее известным днём из имени файла.
     """
     for i, row in enumerate(rows[:15]):
         if not row:
             continue
         cols = _match_columns(row)
-        if "day" in cols and any(k in cols for k in VALUE_KEYS):
+        if not any(k in cols for k in VALUE_KEYS):
+            continue
+        if "day" in cols or default_day:
             return i, cols
     return -1, {}
 
 
-def parse_rows(rows, source=""):
+def parse_rows(rows, source="", default_day=""):
     """
     Строки файла -> {ключ_товара: {день: {views, sessions, tocart, position}}}.
     Ключ — артикул, если он есть в файле, иначе sku.
+
+    default_day — день, к которому отнести весь файл, когда колонки с датой
+    в нём нет. Берётся из имени файла вызывающим кодом.
     """
-    head, cols = _find_header(rows)
+    head, cols = _find_header(rows, default_day)
     if head < 0:
         sample = _norm(" | ".join(str(c) for c in (rows[0] if rows else [])))
         if any("день" not in _norm(str(c)) for c in (rows[0] if rows else [])) \
                 and rows:
             raise CabinetImportError(
-                f"{source}: не нашёл колонку с датой. Нужна выгрузка С "
-                f"РАЗБИВКОЙ ПО ДНЯМ — без неё подневный отчёт заполнить "
-                f"нельзя. Первая строка файла: {sample[:200]}")
+                f"{source}: не понял, за какой день файл. В кабинете разреза "
+                f"по дням нет, поэтому дату надо взять из имени файла — "
+                f"назовите его датой выгруженного дня, например "
+                f"2026-08-08.xlsx. Первая строка файла: {sample[:200]}")
         raise CabinetImportError(f"{source}: не разобрал шапку файла")
 
     if "offer_id" not in cols and "sku" not in cols:
@@ -229,7 +266,7 @@ def parse_rows(rows, source=""):
             i = cols.get(role)
             return row[i] if i is not None and i < len(row) else None
 
-        day = _day(cell("day"))
+        day = _day(cell("day")) if "day" in cols else default_day
         if not day:
             bad_days += 1
             continue
@@ -268,7 +305,12 @@ def parse_rows(rows, source=""):
 
 
 def parse_file(data, name=""):
-    """Байты файла -> разобранные строки. Формат по расширению."""
+    """
+    Байты файла -> разобранные строки. Формат по расширению.
+
+    Если колонки с датой в файле нет, день берётся из имени: кабинет не
+    умеет разрез по дням, поэтому один файл = один день.
+    """
     low = name.lower()
     if low.endswith(".csv") or low.endswith(".txt"):
         rows = _rows_from_csv(data)
@@ -278,32 +320,54 @@ def parse_file(data, name=""):
         rows = _rows_from_xlsx(data)
     else:
         rows = _rows_from_csv(data)
-    return parse_rows(rows, source=name or "файл")
+    return parse_rows(rows, source=name or "файл",
+                      default_day=day_from_name(name))
 
 
 # ------------------------------------------------------------------ источники
 
-def _newest_local(folder):
+# Сколько файлов читать из папки магазина. Один файл — один день, за месяц
+# их набирается три десятка; потолок нужен, чтобы случайно сваленная туда
+# сотня файлов не растянула сбор.
+MAX_FILES = 40
+
+
+def _merge(dst, src):
+    """Складывает разборы разных файлов. Один и тот же день перезаписывается."""
+    for key, days in (src or {}).items():
+        dst.setdefault(key, {}).update(days)
+    return dst
+
+
+def _local_files(folder):
     if not os.path.isdir(folder):
-        return None
+        return []
     files = [os.path.join(folder, f) for f in os.listdir(folder)
              if f.lower().endswith((".xlsx", ".xlsm", ".csv", ".txt"))
              and not f.startswith("~$")]
-    if not files:
-        return None
-    return max(files, key=os.path.getmtime)
+    # свежие последними: если два файла про один день, победит новый
+    return sorted(files, key=os.path.getmtime)[-MAX_FILES:]
 
 
 def load_local(store_name, data_dir):
-    """Самый свежий файл из DATA_DIR/import/<Магазин>/."""
-    path = _newest_local(os.path.join(data_dir, "import", store_name))
-    if not path:
-        return {}
-    with open(path, "rb") as f:
-        data = f.read()
-    out = parse_file(data, os.path.basename(path))
-    log.info("[%s] выгрузка кабинета: %s, товаров %d",
-             store_name, os.path.basename(path), len(out))
+    """Все файлы из DATA_DIR/import/<Магазин>/ — по файлу на день."""
+    out, days, bad = {}, set(), 0
+    for path in _local_files(os.path.join(data_dir, "import", store_name)):
+        name = os.path.basename(path)
+        try:
+            with open(path, "rb") as f:
+                part = parse_file(f.read(), name)
+        except CabinetImportError as e:
+            bad += 1
+            log.warning("[%s] %s", store_name, e)
+            continue
+        days |= {d for v in part.values() for d in v}
+        _merge(out, part)
+    if out:
+        log.info("[%s] выгрузка кабинета: файлов %d, дней %d, товаров %d",
+                 store_name, len(days) if days else 0, len(days), len(out))
+    elif bad:
+        log.warning("[%s] ни один файл выгрузки прочитать не удалось", store_name)
     return out
 
 
@@ -332,26 +396,36 @@ def load_drive(store_name, folder_id, credentials_file):
 
     q = f"'{sub['id']}' in parents and trashed = false"
     files = drive.files().list(
-        q=q, orderBy="modifiedTime desc", pageSize=10,
+        q=q, orderBy="modifiedTime", pageSize=MAX_FILES,
         fields="files(id,name,mimeType,modifiedTime)").execute().get("files", [])
     files = [f for f in files if f["mimeType"] != "application/vnd.google-apps.folder"]
     if not files:
         log.info("[%s] подпапка на Диске пуста — пропускаю", store_name)
         return {}
 
-    f = files[0]
-    if f["mimeType"] == "application/vnd.google-apps.spreadsheet":
-        data = drive.files().export(
-            fileId=f["id"],
-            mimeType="text/csv").execute()
-        name = f["name"] + ".csv"
-    else:
-        data = drive.files().get_media(fileId=f["id"]).execute()
-        name = f["name"]
+    out, days, bad = {}, set(), 0
+    for f in files:
+        if f["mimeType"] == "application/vnd.google-apps.spreadsheet":
+            data = drive.files().export(fileId=f["id"], mimeType="text/csv").execute()
+            name = f["name"] + ".csv"
+        else:
+            data = drive.files().get_media(fileId=f["id"])
+            data = data.execute() if hasattr(data, "execute") else data
+            name = f["name"]
+        try:
+            part = parse_file(data, name)
+        except CabinetImportError as e:
+            bad += 1
+            log.warning("[%s] %s", store_name, e)
+            continue
+        days |= {d for v in part.values() for d in v}
+        _merge(out, part)
 
-    out = parse_file(data, name)
-    log.info("[%s] выгрузка кабинета с Диска: %s (%s), товаров %d",
-             store_name, name, f.get("modifiedTime", "")[:10], len(out))
+    if out:
+        log.info("[%s] выгрузка кабинета с Диска: файлов %d, дней %d, товаров %d",
+                 store_name, len(files) - bad, len(days), len(out))
+    elif bad:
+        log.warning("[%s] на Диске %d файлов, но ни один не прочитан", store_name, bad)
     return out
 
 
