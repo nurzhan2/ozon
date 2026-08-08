@@ -239,7 +239,8 @@ ws = wb.active
 check("пустой список не двигает курсор",
       R._quality_write_notes(ws, 5, [], 3) == 5)
 r = R._quality_write_notes(ws, 5, ["hits_tocart"], 3)
-check("одна строка — заголовок и пояснение", r == 8, r)
+# 6 — заголовок, 7 — пояснение, 8 — приписка про то, как это чинится
+check("заголовок, пояснение и приписка с решением", r == 9, r)
 check("в тексте назван виновник — Premium Plus",
       "Premium Plus" in str(ws.cell(7, 1).value), ws.cell(7, 1).value)
 

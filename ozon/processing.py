@@ -346,3 +346,56 @@ def compare_day_over_day(today_products, prev_products, metrics):
     if sort_key:
         rows.sort(key=lambda r: r.get(sort_key, 0) or 0, reverse=True)
     return rows
+
+
+def merge_cabinet(daily, cab, sku_map):
+    """
+    Выгрузка из личного кабинета -> недостающие метрики.
+
+      views    -> hits_view          «показы»
+      sessions -> session_view       «клики» (настоящие, не только рекламные)
+      tocart   -> hits_tocart        «корзина»
+      position -> position_category  «место в поиске»
+
+    Кабинет — единственный источник корзины: в API её нет ни в одном методе
+    без подписки Premium Plus. Значения кабинета ПЕРЕКРЫВАЮТ то, что уже
+    подмешано из рекламы и из product-queries: там суррогаты, здесь то же,
+    что видит клиент у себя в интерфейсе.
+
+    Нули из файла не перекрывают ничего: пустая клетка в выгрузке и честный
+    ноль в кабинете выглядят одинаково, а занулять уже собранное нельзя.
+
+    Возвращает множество ключей, которые реально заполнились, — по нему
+    отчёт решает, называть строку «клики» или «клики (реклама)».
+    """
+    filled = set()
+    by_offer = {}
+    for key, days in (cab or {}).items():
+        offer = key
+        try:
+            info = sku_map.get(int(key))
+            if info:
+                offer = info["offer_id"]
+        except (TypeError, ValueError):
+            pass
+        by_offer.setdefault(offer, {}).update(days)
+        by_offer.setdefault(str(key), {}).update(days)
+
+    pairs = (("views", "hits_view"), ("sessions", "session_view"),
+             ("tocart", "hits_tocart"), ("position", "position_category"))
+
+    for rec in daily.values():
+        src = {}
+        for k in _rec_keys(rec):
+            if k in by_offer:
+                src = by_offer[k]
+                break
+        for day, d in rec["days"].items():
+            row = src.get(day)
+            if not row:
+                continue
+            for role, metric in pairs:
+                if row.get(role):
+                    d[metric] = row[role]
+                    filled.add(metric)
+    return filled

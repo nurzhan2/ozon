@@ -346,11 +346,10 @@ def build_intraday(collectors, cfg, snapshots_dir=None):
 # CTR — два знака (1,85%), % корзины и ДРР — один (20,5% / 14,7%),
 # место в поиске — целое число (62, 72, 54).
 QUALITY_ROWS = [
-    # «показы» — уникальные посетители из «запросов моих товаров»
-    # (/v1/analytics/product-queries, доступен с обычным Premium).
-    # «клики» и «CTR» — рекламные: кликов по всему магазину без Premium Plus
-    # взять неоткуда, поэтому подписаны честно и считаются от рекламной пары
-    # показы/клики, чтобы процент был осмысленным.
+    # Подписи «(реклама)» стоят потому, что без выгрузки из кабинета клики
+    # берутся только из рекламного отчёта: органических взять неоткуда, а
+    # выдавать рекламные за общие нельзя. Появится выгрузка — подписи
+    # снимаются, см. _quality_rows_for().
     ("показы", "hits_view", X.FMT_PLAIN_INT),
     ("клики (реклама)", "session_view", X.FMT_PLAIN_INT),
     ("CTR (реклама)", "ctr", X.FMT_PCT2),
@@ -365,8 +364,29 @@ QUALITY_ROWS = [
 ]
 
 
-def _quality_day_values(d):
-    """Расчёт производных показателей за один день по образцу."""
+def _quality_rows_for(filled):
+    """
+    Строки листа с учётом того, откуда пришли клики.
+
+    Если выгрузка из кабинета закрыла session_view, клики в отчёте общие, а
+    не рекламные, — пометка в названии становится враньём наоборот и её надо
+    убрать. Пока выгрузки нет, пометка остаётся.
+    """
+    if "session_view" not in (filled or ()):
+        return QUALITY_ROWS
+    return [(label.replace(" (реклама)", ""), key, fmt)
+            for label, key, fmt in QUALITY_ROWS]
+
+
+def _quality_day_values(d, unified=False):
+    """
+    Расчёт производных показателей за один день по образцу.
+
+    unified=True — показы и клики пришли из одного источника (выгрузка
+    кабинета), тогда CTR считается по ним. Иначе показы из поиска, а клики
+    только рекламные, и делить одно на другое бессмысленно: CTR берётся по
+    рекламной паре, а строка подписана «(реклама)».
+    """
     views = d.get("hits_view", 0) or 0
     clicks = d.get("session_view", 0) or 0
     # CTR считаем от рекламной пары: показы приходят из поиска, клики — из
@@ -381,7 +401,12 @@ def _quality_day_values(d):
     return {
         "hits_view": int(round(views)),
         "session_view": int(round(clicks)),
-        "ctr": _safe_div(ad_clicks, ad_views),
+        # рекламная пара нужна дальше, чтобы итог строки CTR считался тем же
+        # способом, что и дни, и колонка «Итого» сходилась с колонками дней
+        "ad_views": int(round(ad_views)),
+        "ad_clicks": int(round(ad_clicks)),
+        "ctr": (_safe_div(clicks, views) if unified
+                else _safe_div(ad_clicks, ad_views)),
         "hits_tocart": int(round(cart)),
         "cart_rate": _safe_div(cart, clicks),
         "bought": int(round(max(ordered - cancel, 0))),
@@ -408,11 +433,20 @@ QUALITY_EMPTY_NOTES = [
     ("место в поиске", "position_category",
      "Тот же источник, что и «показы», — пусто по той же причине."),
     ("корзина", "hits_tocart",
-     "Доступна только с подпиской Premium Plus. Обходного источника нет: ни "
-     "рекламные отчёты, ни отправления о добавлениях в корзину не знают."),
+     "По API её не отдаёт ни один метод без подписки Premium Plus. "
+     "Заполняется выгрузкой из кабинета — см. ниже."),
     ("% корзины", "cart_rate",
      "Считается от «корзины», поэтому пусто вместе с ней."),
 ]
+
+# Приписка под сноской: у всех четырёх строк одно и то же решение, и клиенту
+# важнее знать, что делать, чем почему не работает.
+QUALITY_EMPTY_FIX = (
+    "Все эти строки заполнятся, если раз в день выгружать из кабинета отчёт "
+    "«Аналитика → Графики» с разрезами «День» и «Товар» и класть файл в общую "
+    "папку — инструкция в файле ВЫГРУЗКА_ИЗ_КАБИНЕТА.md. Второй вариант — "
+    "подписка Premium Plus, тогда всё придёт по API само."
+)
 
 
 def _quality_empty_keys(store_totals, day_keys):
@@ -439,10 +473,16 @@ def _quality_write_notes(ws, r, empty_keys, width):
         X.style_body_cell(cc)
         cc.alignment = X.LEFT
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=span)
+    r += 1
+    cc = ws.cell(r, 1, value=QUALITY_EMPTY_FIX)
+    X.style_body_cell(cc, bold=True)
+    cc.alignment = X.LEFT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=span)
     return r + 1
 
 
-def _quality_write_block(ws, r, title, days, vals_by_day, day_keys, with_total):
+def _quality_write_block(ws, r, title, days, vals_by_day, day_keys, with_total,
+                         rows=None, unified=False):
     """Один блок «метрики строками, дни колонками». Возвращает следующую строку."""
     c = ws.cell(r, 1, value=title)
     X.style_header_cell(c, yellow=True)
@@ -453,7 +493,7 @@ def _quality_write_block(ws, r, title, days, vals_by_day, day_keys, with_total):
     if with_total:
         X.style_header_cell(ws.cell(r, 2 + len(days), value="Итого"))
 
-    for label, key, fmt in QUALITY_ROWS:
+    for label, key, fmt in (rows or QUALITY_ROWS):
         r += 1
         cc = ws.cell(r, 1, value=label)
         X.style_body_cell(cc)
@@ -463,14 +503,15 @@ def _quality_write_block(ws, r, title, days, vals_by_day, day_keys, with_total):
         if with_total:
             X.style_body_cell(
                 ws.cell(r, 2 + len(days),
-                        value=_quality_row_total(key, vals_by_day, day_keys)),
+                        value=_quality_row_total(key, vals_by_day, day_keys,
+                                                 unified)),
                 fmt, bold=True)
         # шкала по строке — как в образце, каждая метрика красится по своему ряду
         X.color_scale(ws, f"{X.col(2)}{r}:{X.col(1 + len(days))}{r}")
     return r + 2
 
 
-def _quality_store_totals(items, day_keys):
+def _quality_store_totals(items, day_keys, unified=False):
     """
     Свод по магазину на каждый день — блок «по аналитике».
     Аддитивные метрики складываются, «место в поиске» усредняется по товарам
@@ -491,7 +532,7 @@ def _quality_store_totals(items, day_keys):
             if pos:
                 positions.append(pos)
         acc["position_category"] = (sum(positions) / len(positions)) if positions else 0
-        out[k] = _quality_day_values(acc)
+        out[k] = _quality_day_values(acc, unified)
     return out
 
 
@@ -519,21 +560,30 @@ def build_quality(collectors, cfg):
         ws = wb.create_sheet(X.safe_title(colr.name))
         r = 1
 
+        # Клики из выгрузки кабинета — общие, а не рекламные: тогда и CTR
+        # считается по своей паре, и пометка «(реклама)» из названий уходит.
+        filled = getattr(colr, "cabinet_filled", set()) or set()
+        unified = "session_view" in filled
+        rows_def = _quality_rows_for(filled)
+
         # --- сводный блок по магазину ---
         empty_keys = []
         if items:
-            store_totals = _quality_store_totals(items, day_keys)
+            store_totals = _quality_store_totals(items, day_keys, unified)
             empty_keys = _quality_empty_keys(store_totals, day_keys)
             r = _quality_write_block(ws, r, "по аналитике", days,
-                                     store_totals, day_keys, with_total)
+                                     store_totals, day_keys, with_total,
+                                     rows_def, unified)
 
         # --- блок на каждый товар ---
         for rec in items:
-            vals_by_day = {k: _quality_day_values(rec["days"].get(k, {})) for k in day_keys}
+            vals_by_day = {k: _quality_day_values(rec["days"].get(k, {}), unified)
+                           for k in day_keys}
             if not any(v["hits_view"] or v["revenue"] for v in vals_by_day.values()):
                 continue
             r = _quality_write_block(ws, r, rec["name"] or rec["offer_id"], days,
-                                     vals_by_day, day_keys, with_total)
+                                     vals_by_day, day_keys, with_total,
+                                     rows_def, unified)
 
         # --- сноска про пустые строки, если такие есть ---
         _quality_write_notes(ws, r, empty_keys,
@@ -549,14 +599,19 @@ def build_quality(collectors, cfg):
     return path
 
 
-def _quality_row_total(key, vals_by_day, day_keys):
+def _quality_row_total(key, vals_by_day, day_keys, unified=False):
     """Итог строки: аддитивные метрики суммируем, доли/позицию пересчитываем."""
     vals = [vals_by_day[k] for k in day_keys]
     if key in ("hits_view", "session_view", "hits_tocart", "bought",
                "cancellations", "revenue", "ad_spend"):
         return round(sum(v[key] for v in vals))
     if key == "ctr":
-        return _safe_div(sum(v["session_view"] for v in vals), sum(v["hits_view"] for v in vals))
+        # итог считается тем же способом, что и дни, иначе строка не сойдётся
+        if unified:
+            return _safe_div(sum(v["session_view"] for v in vals),
+                             sum(v["hits_view"] for v in vals))
+        return _safe_div(sum(v.get("ad_clicks", 0) for v in vals),
+                         sum(v.get("ad_views", 0) for v in vals))
     if key == "cart_rate":
         return _safe_div(sum(v["hits_tocart"] for v in vals), sum(v["session_view"] for v in vals))
     if key == "drr":

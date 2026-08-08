@@ -10,6 +10,7 @@ import logging
 from .seller_api import SellerAPI, SellerAPIError, METRICS_REPORT
 from .performance_api import PerformanceAPI
 from . import processing as P
+from . import cabinet as CAB
 from . import dates as D
 
 log = logging.getLogger("ozon.collector")
@@ -71,6 +72,8 @@ class StoreCollector:
         # Запросы товаров (показы и позиция) — по дням, потому что отчёты
         # показывают их подневно. Кэш нужен: отчёты 1 и 3 берут один период.
         self._queries_cache = {}
+        self._cabinet = None          # выгрузка кабинета, читается лениво
+        self.cabinet_filled = set()   # какие метрики она реально закрыла
         # взводится после двух отказов product-queries подряд, см. queries_by_day
         self._queries_off = False
         # Отмены из отправлений — по периодам.
@@ -181,8 +184,24 @@ class StoreCollector:
         c = self.cancels(df, dt)
         if c:
             P.merge_cancels(result, c, sku_map)
+        # выгрузка из кабинета — идёт ПОСЛЕДНЕЙ и перекрывает суррогаты:
+        # это единственный источник корзины и самые верные показы с кликами
+        cab = self.cabinet_data()
+        if cab:
+            self.cabinet_filled = P.merge_cabinet(result, cab, sku_map)
         self._daily_cache[key] = (result, order)
         return result, order
+
+    def cabinet_data(self):
+        """Выгрузка из личного кабинета, если её положили. Читается один раз."""
+        if self._cabinet is None:
+            try:
+                self._cabinet = CAB.load(self.name, self.cfg) or {}
+            except Exception as e:      # источник необязательный, сбор важнее
+                log.warning("[%s] выгрузку кабинета прочитать не удалось: %s",
+                            self.name, str(e)[:200])
+                self._cabinet = {}
+        return self._cabinet
 
     def products_for_period(self, date_from, date_to, only_in_stock=True,
                             metrics=None, with_kpi=True):
