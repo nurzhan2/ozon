@@ -393,6 +393,55 @@ def _quality_day_values(d):
     }
 
 
+# Строки, которые могут остаться пустыми не из-за магазина, а из-за того, что
+# OZON не отдаёт данные. Клиент, увидев нули, решит, что товар никто не смотрел,
+# поэтому под таблицей печатается пояснение — но только по тем строкам, которые
+# в этом файле действительно вышли пустыми.
+QUALITY_EMPTY_NOTES = [
+    ("показы", "hits_view",
+     "Их отдаёт метод «запросы моих товаров». Подписка Premium для него есть, "
+     "но на этих аккаунтах он отвечает «нет данных за период» даже за дни, за "
+     "которые данные у него заведомо есть: одно и то же окно то возвращает "
+     "числа, то отказывает. Проверены формат дат, длина окна, недельное "
+     "выравнивание и частота запросов — причина не найдена. Строка заполнится "
+     "сама, как только метод начнёт отвечать: код запрашивает его каждый раз."),
+    ("место в поиске", "position_category",
+     "Тот же источник, что и «показы», — пусто по той же причине."),
+    ("корзина", "hits_tocart",
+     "Доступна только с подпиской Premium Plus. Обходного источника нет: ни "
+     "рекламные отчёты, ни отправления о добавлениях в корзину не знают."),
+    ("% корзины", "cart_rate",
+     "Считается от «корзины», поэтому пусто вместе с ней."),
+]
+
+
+def _quality_empty_keys(store_totals, day_keys):
+    """Какие из спорных строк вышли пустыми по всему магазину."""
+    return [key for _label, key, _note in QUALITY_EMPTY_NOTES
+            if not any(store_totals.get(k, {}).get(key) for k in day_keys)]
+
+
+def _quality_write_notes(ws, r, empty_keys, width):
+    """Сноска под таблицей. Пустых строк нет — ничего не пишем."""
+    if not empty_keys:
+        return r
+    span = max(width, 2)
+    r += 1
+    X.style_header_cell(ws.cell(r, 1, value="Почему эти строки пустые"),
+                        yellow=True)
+    for i in range(1, span):
+        X.style_header_cell(ws.cell(r, 1 + i, value=""))
+    for label, key, note in QUALITY_EMPTY_NOTES:
+        if key not in empty_keys:
+            continue
+        r += 1
+        cc = ws.cell(r, 1, value=f"{label} — {note}")
+        X.style_body_cell(cc)
+        cc.alignment = X.LEFT
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=span)
+    return r + 1
+
+
 def _quality_write_block(ws, r, title, days, vals_by_day, day_keys, with_total):
     """Один блок «метрики строками, дни колонками». Возвращает следующую строку."""
     c = ws.cell(r, 1, value=title)
@@ -471,10 +520,12 @@ def build_quality(collectors, cfg):
         r = 1
 
         # --- сводный блок по магазину ---
+        empty_keys = []
         if items:
+            store_totals = _quality_store_totals(items, day_keys)
+            empty_keys = _quality_empty_keys(store_totals, day_keys)
             r = _quality_write_block(ws, r, "по аналитике", days,
-                                     _quality_store_totals(items, day_keys),
-                                     day_keys, with_total)
+                                     store_totals, day_keys, with_total)
 
         # --- блок на каждый товар ---
         for rec in items:
@@ -483,6 +534,10 @@ def build_quality(collectors, cfg):
                 continue
             r = _quality_write_block(ws, r, rec["name"] or rec["offer_id"], days,
                                      vals_by_day, day_keys, with_total)
+
+        # --- сноска про пустые строки, если такие есть ---
+        _quality_write_notes(ws, r, empty_keys,
+                             1 + len(days) + (1 if with_total else 0))
 
         X.set_widths(ws, [24] + [11] * len(days) + ([12] if with_total else []))
         ws.freeze_panes = "B1"

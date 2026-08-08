@@ -206,5 +206,43 @@ check("данные разложены по дням",
       res.get("2026-07-01", {}).get("111", {}).get("views") == 5,
       res.get("2026-07-01"))
 
+print("\n9. Сноска в отчёте 3: объясняет только те строки, что реально пусты")
+from ozon import reports as R
+
+DAYS = ["2026-08-05", "2026-08-06"]
+
+
+def totals(**over):
+    base = {"hits_view": 0, "hits_tocart": 0, "cart_rate": 0,
+            "position_category": 0}
+    base.update(over)
+    return {d: dict(base) for d in DAYS}
+
+
+keys = R._quality_empty_keys(totals(), DAYS)
+check("всё пусто — перечислены все четыре строки",
+      set(keys) == {"hits_view", "hits_tocart", "cart_rate",
+                    "position_category"}, keys)
+
+keys = R._quality_empty_keys(totals(hits_view=900, position_category=7), DAYS)
+check("показы пришли — про них не пишем",
+      set(keys) == {"hits_tocart", "cart_rate"}, keys)
+
+keys = R._quality_empty_keys(
+    totals(hits_view=1, hits_tocart=1, cart_rate=0.5, position_category=3), DAYS)
+check("всё заполнено — сноски нет вовсе", keys == [], keys)
+
+# и сама сноска ничего не рисует, когда объяснять нечего
+from openpyxl import Workbook
+wb = Workbook()
+ws = wb.active
+check("пустой список не двигает курсор",
+      R._quality_write_notes(ws, 5, [], 3) == 5)
+r = R._quality_write_notes(ws, 5, ["hits_tocart"], 3)
+check("одна строка — заголовок и пояснение", r == 8, r)
+check("в тексте назван виновник — Premium Plus",
+      "Premium Plus" in str(ws.cell(7, 1).value), ws.cell(7, 1).value)
+
+
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 sys.exit(0 if ok else 1)
