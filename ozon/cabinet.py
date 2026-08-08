@@ -52,16 +52,29 @@ COLUMNS = {
     "sku": ("sku", "ozon id", "озон id", "ид товара", "идентификатор товара"),
     "views": ("показы", "показов", "показы всего", "просмотры", "hits_view",
               "views"),
-    "sessions": ("сессии", "сессий", "уникальные посетители", "посетители",
-                 "session_view", "клики", "переходы"),
+    # «Уникальные посетители, всего» — это session_view в терминах API:
+    # уникальные люди, а не показы. Идёт в строку «клики».
+    "sessions": ("уникальные посетители, всего", "сессии", "сессий",
+                 "уникальные посетители", "посетители", "session_view",
+                 "клики", "переходы"),
+    # Посетители именно карточки: нужны, чтобы развернуть конверсию в штуки.
+    "sessions_pdp": ("уникальные посетители с просмотром карточки товара",
+                     "с просмотром карточки", "session_view_pdp"),
     "tocart": ("в корзину", "корзина", "добавления в корзину",
                "добавлено в корзину", "hits_tocart", "add_to_cart"),
+    # В выгрузке кабинета корзина часто есть только процентом.
+    "conv_tocart": ("конверсия в корзину из карточки товара",
+                    "конверсия в корзину", "conv_tocart"),
     "position": ("позиция", "место в поиске", "средняя позиция",
                  "position", "position_category"),
 }
 
 # Колонки, ради которых всё затевается. Файл без единой из них бесполезен.
-VALUE_KEYS = ("views", "sessions", "tocart", "position")
+VALUE_KEYS = ("views", "sessions", "sessions_pdp", "tocart", "conv_tocart",
+              "position")
+
+# Складываются при повторах; позиция и конверсия — нет, это доли и места.
+SUM_KEYS = ("views", "sessions", "sessions_pdp", "tocart")
 
 
 class CabinetImportError(Exception):
@@ -77,39 +90,57 @@ def _norm(s):
     return re.sub(r"[\s ]+", " ", s).strip()
 
 
+# Порядок разбора шапки. Роли идут от самых узких к широким, и одна колонка
+# достаётся только одной роли. Без этого «Конверсия в корзину из карточки
+# товара» попадала и в conv_tocart, и в tocart — потому что содержит слова
+# «в корзину», — и в отчёт вместо штук уезжала доля 0,37.
+ROLE_ORDER = ("day", "offer_id", "sku", "conv_tocart", "sessions_pdp",
+              "tocart", "views", "sessions", "position")
+
+
 def _match_columns(header):
     """{наша_роль: индекс_колонки}. Точное совпадение важнее вхождения."""
     norm = [_norm(h) for h in header]
-    found = {}
-    for role, names in COLUMNS.items():
-        for i, h in enumerate(norm):
-            if h in names:
-                found[role] = i
+    found, used = {}, set()
+    for role in ROLE_ORDER:
+        names = COLUMNS[role]
+        for i, h in enumerate(norm):          # сначала точное совпадение
+            if i not in used and h in names:
+                found[role], _ = i, used.add(i)
                 break
         if role in found:
             continue
-        for i, h in enumerate(norm):
-            if any(n in h for n in names):
-                found[role] = i
+        for i, h in enumerate(norm):          # затем вхождение
+            if i not in used and any(n in h for n in names):
+                found[role], _ = i, used.add(i)
                 break
     return found
 
 
 def _num(v):
-    """«1 234,5» и «1,234.5» — в число. Мусор — в ноль."""
+    """
+    «1 234,5», «1,234.5» и «36,99%» — в число. Мусор — в ноль.
+
+    Процент возвращается долей: 36,99% -> 0.3699. Иначе конверсия, которой
+    в выгрузке кабинета заменяют абсолютную корзину, была бы завышена
+    в сто раз.
+    """
     if v is None or v == "":
         return 0.0
     if isinstance(v, (int, float)):
         return float(v)
-    s = str(v).strip().replace(" ", "").replace(" ", "").replace("%", "")
+    raw = str(v)
+    pct = "%" in raw
+    s = raw.strip().replace("\u00a0", "").replace(" ", "").replace("%", "")
     if "," in s and "." in s:
         s = s.replace(",", "")          # 1,234.5
     else:
         s = s.replace(",", ".")         # 1234,5
     try:
-        return float(s)
+        num = float(s)
     except ValueError:
         return 0.0
+    return num / 100.0 if pct else num
 
 
 _DATE_PATTERNS = ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%Y/%m/%d", "%d-%m-%Y")
@@ -207,16 +238,27 @@ def parse_rows(rows, source=""):
             continue
 
         rec = out.setdefault(key, {}).setdefault(
-            day, {"views": 0.0, "sessions": 0.0, "tocart": 0.0, "position": 0.0})
+            day, {r: 0.0 for r in VALUE_KEYS})
         for role in VALUE_KEYS:
             if role in cols:
                 v = _num(cell(role))
-                if role == "position":
-                    # позиция — не сумма: берём последнюю ненулевую
-                    if v:
-                        rec[role] = v
-                else:
+                if role in SUM_KEYS:
                     rec[role] += v
+                elif v:
+                    # позиция и конверсия — доли и места, их не складывают
+                    rec[role] = v
+
+    # Корзину кабинет часто отдаёт только процентом «конверсия в корзину из
+    # карточки товара». Штуки из него получаются умножением на посетителей
+    # карточки — это арифметика над двумя отданными числами, а не догадка.
+    # Но считается она ТОЛЬКО по карточке: добавления из поиска и каталога
+    # сюда не попадают, поэтому число выйдет ниже кабинетного «в корзину».
+    if "tocart" not in cols and "conv_tocart" in cols and "sessions_pdp" in cols:
+        for days in out.values():
+            for rec in days.values():
+                rec["tocart"] = rec["conv_tocart"] * rec["sessions_pdp"]
+        log.info("%s: колонки «в корзину» нет — считаю из конверсии по "
+                 "карточке, число будет ниже кабинетного", source)
 
     if bad_days:
         log.debug("%s: строк без разобранной даты: %d", source, bad_days)
