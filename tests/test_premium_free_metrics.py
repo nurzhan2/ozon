@@ -157,5 +157,54 @@ check("запрошены оба источника",
 check("фильтр по статусу — отменённые",
       True)
 
+print("\n8. Предохранитель: два отказа product-queries подряд — и хватит")
+
+
+class FailingSeller:
+    """Отдаёт данные первые fail_after раз, дальше отказывает как боевой OZON."""
+
+    def __init__(self, fail_after=0):
+        self.fail_after = fail_after
+        self.calls = []
+
+    def product_queries(self, d_from, d_to, skus):
+        self.calls.append(d_from)
+        if len(self.calls) > self.fail_after:
+            raise SellerAPIError("There is no data for the specified period")
+        return {"111": {"views": 5, "position": 3.0}}
+
+
+def collector_with(seller):
+    c = StoreCollector.__new__(StoreCollector)
+    c.name = "ТЕСТ"
+    c.seller = seller
+    c.cfg = type("C", (), {"tz": "Europe/Moscow"})()
+    c._queries_cache = {}
+    c._queries_off = False
+    c.maps = lambda: ({"111": {"offer_id": "ART-1"}}, {})
+    return c
+
+
+s = FailingSeller(fail_after=0)
+c = collector_with(s)
+res = c.queries_by_day("2026-07-01", "2026-07-07")
+check("после двух отказов запросы прекратились", len(s.calls) == 2, s.calls)
+check("вернулся словарь, а не исключение", isinstance(res, dict), type(res))
+check("предохранитель взведён", c._queries_off is True)
+
+s = FailingSeller(fail_after=1)
+c = collector_with(s)
+c.queries_by_day("2026-07-01", "2026-07-07")
+check("удача в начале не отменяет двух отказов подряд",
+      len(s.calls) == 3, s.calls)
+
+s = FailingSeller(fail_after=99)
+c = collector_with(s)
+res = c.queries_by_day("2026-07-01", "2026-07-04")
+check("когда метод жив, собраны все дни", len(s.calls) == 4, s.calls)
+check("данные разложены по дням",
+      res.get("2026-07-01", {}).get("111", {}).get("views") == 5,
+      res.get("2026-07-01"))
+
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 sys.exit(0 if ok else 1)

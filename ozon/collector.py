@@ -71,6 +71,8 @@ class StoreCollector:
         # Запросы товаров (показы и позиция) — по дням, потому что отчёты
         # показывают их подневно. Кэш нужен: отчёты 1 и 3 берут один период.
         self._queries_cache = {}
+        # взводится после двух отказов product-queries подряд, см. queries_by_day
+        self._queries_off = False
         # Отмены из отправлений — по периодам.
         self._cancel_cache = {}
 
@@ -209,6 +211,16 @@ class StoreCollector:
         что отчёты показывают их подневно; каждый день кэшируется.
 
         Сегодняшний день OZON не считает («расчёт идёт 1-2 дня») — пропускаем.
+
+        Метод капризен: на одно и то же окно он отвечает то данными, то
+        «There is no data for the specified period», причём отказ приходит
+        и на те дни, за которые данные заведомо есть. Разобраться, от чего
+        это зависит, пока не удалось (проверены формат дат, длина окна,
+        выравнивание по неделям, частота запросов — ни одна версия не
+        подтвердилась). Поэтому здесь стоит предохранитель: после двух
+        отказов подряд магазин перестаёт опрашиваться до конца прогона.
+        Иначе на пустом месте уходит по запросу на каждый день периода,
+        а лог заполняется одинаковыми предупреждениями.
         """
         sku_map, _ = self.maps()
         skus = list(sku_map)
@@ -217,20 +229,32 @@ class StoreCollector:
         today = D.d(D.today(getattr(self.cfg, "tz", "Europe/Moscow"))
                     if hasattr(self.cfg, "tz") else D.today())
         out = {}
+        misses = 0
         for day in _days_between(date_from, date_to):
             if day >= today:
                 continue
             if day not in self._queries_cache:
+                if self._queries_off:
+                    continue
                 try:
                     self._queries_cache[day] = self.seller.product_queries(
                         day, day, skus)
+                    misses = 0
                 except SellerAPIError as e:
+                    misses += 1
                     # 200 символов обрезали ответ OZON ровно на том месте, где
                     # начиналась причина отказа: «desc = There is n...».
                     log.warning("[%s] запросы товаров за %s недоступны: %s",
                                 self.name, day, str(e)[:600])
                     self._queries_cache[day] = {}
-            out[day] = self._queries_cache[day]
+                    if misses >= 2:
+                        self._queries_off = True
+                        log.warning(
+                            "[%s] product-queries отказывает подряд — "
+                            "больше не спрашиваю в этом прогоне. Строки "
+                            "«показы» и «место в поиске» останутся пустыми.",
+                            self.name)
+            out[day] = self._queries_cache.get(day, {})
         return out
 
     def cancels(self, date_from, date_to):
