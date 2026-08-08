@@ -237,5 +237,17 @@ check("сноска считает такую строку пустой толь
       "hits_view" not in R._quality_empty_keys(tot, ["2026-08-05", "2026-08-06"]),
       R._quality_empty_keys(tot, ["2026-08-05", "2026-08-06"]))
 
+print("\n17. Свод сходится с суммой товаров до рубля")
+prods = [{"days": {"d": {"revenue": 100.4, "ad_spend": 33.5, "ordered_units": 1}}},
+         {"days": {"d": {"revenue": 200.4, "ad_spend": 33.5, "ordered_units": 1}}},
+         {"days": {"d": {"revenue": 300.4, "ad_spend": 33.5, "ordered_units": 1}}}]
+tot = R._quality_store_totals(prods, ["d"], False, views_days=set(), cart_days=set())
+per_product = [R._quality_day_values(p["days"]["d"], has_views=False,
+                                     has_cart=False) for p in prods]
+for metric in ("revenue", "ad_spend"):
+    check(f"«{metric}»: свод = сумма товарных клеток",
+          tot["d"][metric] == sum(v[metric] for v in per_product),
+          (tot["d"][metric], sum(v[metric] for v in per_product)))
+
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 sys.exit(0 if ok else 1)

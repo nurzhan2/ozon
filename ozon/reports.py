@@ -524,6 +524,11 @@ def _quality_store_totals(items, day_keys, unified=False,
     Свод по магазину на каждый день — блок «по аналитике».
     Аддитивные метрики складываются, «место в поиске» усредняется по товарам
     (складывать позиции в поиске бессмысленно — получилась бы сумма мест).
+
+    Складываются УЖЕ ОКРУГЛЁННЫЕ значения товаров, а не сырые дроби. Иначе
+    свод считается как round(сумма), а товарные блоки показывают
+    сумму(round), и на полутора десятках товаров расходится на пару рублей.
+    Клиент, сложивший колонку в Excel, увидит эти рубли и будет прав.
     """
     ADDITIVE = ("revenue", "ordered_units", "cancellations", "hits_view",
                 "session_view", "hits_tocart", "ad_spend",
@@ -535,7 +540,7 @@ def _quality_store_totals(items, day_keys, unified=False,
         for rec in items:
             day = rec["days"].get(k) or {}
             for m in ADDITIVE:
-                acc[m] += (day.get(m, 0) or 0)
+                acc[m] += round(day.get(m, 0) or 0)
             pos = day.get("position_category") or 0
             if pos:
                 positions.append(pos)
@@ -599,7 +604,12 @@ def build_quality(collectors, cfg):
         # --- блок на каждый товар ---
         for rec in items:
             vals_by_day = {k: _vals(rec["days"].get(k, {}), k) for k in day_keys}
-            if not any(v["hits_view"] or v["revenue"] for v in vals_by_day.values()):
+            # Раньше условие смотрело только на показы и оборот, и товар,
+            # на который лился бюджет без единой продажи, из отчёта исчезал —
+            # при том что его расход входил в свод магазина. Это ровно тот
+            # случай, который клиент и должен увидеть первым.
+            if not any(v["hits_view"] or v["revenue"] or v["ad_spend"]
+                       for v in vals_by_day.values()):
                 continue
             r = _quality_write_block(ws, r, rec["name"] or rec["offer_id"], days,
                                      vals_by_day, day_keys, with_total,
