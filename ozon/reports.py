@@ -186,19 +186,32 @@ def _dod_block(ws, r, title, rows, totals):
         cc.fill = X.FILL_TOTAL
 
     if last >= first:
-        for i in range(len(DOD_COLUMNS)):
+        for i, (key, _, _fmt) in enumerate(DOD_COLUMNS):
             letter = X.col(2 + i)
-            X.color_scale(ws, f"{letter}{first}:{letter}{last}")
+            rng = f"{letter}{first}:{letter}{last}"
+            # У ДРР «больше» значит «хуже»: обычная шкала красила самый
+            # дорогой в рекламе товар зелёным, будто он лучший.
+            if key == "drr":
+                X.color_scale_inverted(ws, rng)
+            else:
+                X.color_scale(ws, rng)
     return r + 2
 
 
-def _agg(rec, day_keys):
-    """Свод метрик товара за набор дней + расчёт ДРР."""
+def _agg(rec, day_keys, has_views=True):
+    """
+    Свод метрик товара за набор дней + расчёт ДРР.
+
+    has_views=False — OZON ещё не посчитал показы за эти дни (он отстаёт на
+    сутки-двое). Тогда в колонке пусто, а не ноль: ноль рядом с непустыми
+    продажами читается как «товар никто не видел».
+    """
     v = {
         "revenue": round(P.sum_days(rec, day_keys, "revenue")),
         "ordered_units": int(round(P.sum_days(rec, day_keys, "ordered_units"))),
         "ad_spend": round(P.sum_days(rec, day_keys, "ad_spend")),
-        "hits_view": int(round(P.sum_days(rec, day_keys, "hits_view"))),
+        "hits_view": (int(round(P.sum_days(rec, day_keys, "hits_view")))
+                      if has_views else None),
     }
     v["drr"] = _safe_div(v["ad_spend"], v["revenue"])
     return v
@@ -206,9 +219,17 @@ def _agg(rec, day_keys):
 
 def _totals(rows):
     t = {"revenue": 0, "ordered_units": 0, "ad_spend": 0, "hits_view": 0}
+    known_views = False
     for _, v in rows:
         for k in t:
-            t[k] += v.get(k, 0)
+            val = v.get(k)
+            if k == "hits_view":
+                if val is None:
+                    continue
+                known_views = True
+            t[k] += val or 0
+    if not known_views:
+        t["hits_view"] = None
     t["drr"] = _safe_div(t["ad_spend"], t["revenue"])
     return t
 
@@ -220,8 +241,11 @@ def _delta_rows(cur_rows, prev_rows):
     out = []
     for name in list(cur) + [n for n in prev if n not in cur]:
         a, b = cur.get(name, {}), prev.get(name, {})
-        d = {k: (a.get(k, 0) - b.get(k, 0))
-             for k in ("revenue", "ordered_units", "ad_spend", "hits_view")}
+        d = {k: ((a.get(k) or 0) - (b.get(k) or 0))
+             for k in ("revenue", "ordered_units", "ad_spend")}
+        # разница показов имеет смысл, только если посчитаны оба дня
+        av, bv = a.get("hits_view"), b.get("hits_view")
+        d["hits_view"] = None if (av is None or bv is None) else av - bv
         d["drr"] = a.get("drr", 0) - b.get("drr", 0)
         out.append((name, d))
     return out
@@ -250,8 +274,14 @@ def _build_dod_like(collectors, cfg, cur_from, cur_to, prev_from, prev_to,
         cur_keys = [D.d(x) for x in _daterange(cur_from, cur_to)]
         prev_keys = [D.d(x) for x in _daterange(prev_from, prev_to)]
 
-        cur_rows = [(r["name"] or r["offer_id"], _agg(r, cur_keys)) for r in cur_daily.values()]
-        prev_rows = [(r["name"] or r["offer_id"], _agg(r, prev_keys)) for r in prev_daily.values()]
+        # за какие дни OZON вообще посчитал показы
+        v_days = getattr(colr, "days_with_views", set()) or set()
+        cur_v = any(k in v_days for k in cur_keys)
+        prev_v = any(k in v_days for k in prev_keys)
+        cur_rows = [(r["name"] or r["offer_id"], _agg(r, cur_keys, cur_v))
+                    for r in cur_daily.values()]
+        prev_rows = [(r["name"] or r["offer_id"], _agg(r, prev_keys, prev_v))
+                     for r in prev_daily.values()]
         cur_rows, prev_rows = _align_blocks(cur_rows, prev_rows)
 
         ws = wb.create_sheet(X.safe_title(colr.name))
@@ -302,7 +332,11 @@ def build_intraday(collectors, cfg, snapshots_dir=None):
     for colr in collectors:
         cur_daily, _ = colr.daily_by_product(today, today, only_in_stock=True)
         cur_keys = [D.d(today)]
-        cur_rows = [(r["name"] or r["offer_id"], _agg(r, cur_keys)) for r in cur_daily.values()]
+        v_days = getattr(colr, "days_with_views", set()) or set()
+        # за сегодня показов у OZON заведомо ещё нет — колонка будет пустой
+        cur_rows = [(r["name"] or r["offer_id"],
+                     _agg(r, cur_keys, D.d(today) in v_days))
+                    for r in cur_daily.values()]
 
         # снимок текущего слота — для сравнения завтра
         S.save(snapshots_dir, colr.name, D.d(today), hour,
@@ -314,7 +348,8 @@ def build_intraday(collectors, cfg, snapshots_dir=None):
             note = ""
         else:
             prev_daily, _ = colr.daily_by_product(yday, yday, only_in_stock=True)
-            prev_rows = [(r["name"] or r["offer_id"], _agg(r, [D.d(yday)]))
+            prev_rows = [(r["name"] or r["offer_id"],
+                          _agg(r, [D.d(yday)], D.d(yday) in v_days))
                          for r in prev_daily.values()]
             note = " (снимка за вчера на этот час нет — сравнение с полным вчерашним днём)"
         cur_rows, prev_rows = _align_blocks(cur_rows, prev_rows)
@@ -666,8 +701,8 @@ def _quality_row_total(key, vals_by_day, day_keys, unified=False):
 
 STOCK_HEADERS = [
     "Артикул", "Кластер", "Доступно к продаже", "В заявках на поставку",
-    "В поставках в пути", "Итог", "прод 7д", "среднее", "потреб 30д",
-    "потреб 45д", "на сколько дней хватит остатков",
+    "В поставках в пути", "Итог", "прод 7д", "среднее", "ср/28 дней",
+    "потреб 30д", "потреб 45д", "на сколько дней хватит остатков",
 ]
 
 
@@ -679,6 +714,18 @@ def build_stocks(collectors, cfg):
       потреб 30д = среднее*30 - Итог
       потреб 45д = среднее*45 - Итог
       хватит дней = Итог / среднее
+
+    ВСЁ СЧИТАЕТСЯ ПО КЛАСТЕРУ, а не по магазину. Раньше «прод 7д» и «среднее»
+    брались из поля ads, которое OZON отдаёт «по всем кластерам», поэтому во
+    всех строках товара стояло одно и то же число, а «потреб 30д» вычитала
+    остаток одного кластера из потребности всего магазина. Заказчик это
+    заметил, и он прав: смысла в такой цифре нет.
+
+    Теперь источник — ads_cluster, среднесуточные продажи ИМЕННО в этом
+    кластере за 28 дней. «прод 7д» — настоящие продажи товара за последнюю
+    неделю, разложенные по кластерам пропорционально их доле в продажах
+    (ads_cluster), а не по доле в остатках: остаток говорит о том, где товар
+    лежит, а не где он продаётся. «ср/28 дней» — ads_cluster как есть.
     """
     tz = cfg.TIMEZONE
     stamp = D.now_tz(tz).strftime("%Y-%m-%d")
@@ -689,8 +736,7 @@ def build_stocks(collectors, cfg):
     for colr in collectors:
         rows = colr.cluster_stocks()
 
-        # продажи за 7 дней по артикулу (для распределения по кластерам,
-        # если OZON не отдал среднесуточные продажи ads по кластеру)
+        # продажи за 7 дней по артикулу — их и раскладываем по кластерам
         sales7 = {}
         try:
             prods = colr.products_for_period(date_from, date_to, only_in_stock=True,
@@ -721,25 +767,33 @@ def build_stocks(collectors, cfg):
         # считаем «прод 7д» заранее, чтобы отсортировать кластеры по нему
         prepared = []
         for offer_id, crows in by_offer.items():
-            has_ads = any(rr.get("ads") for rr in crows)
+            ads_sum = sum(rr.get("ads") or 0 for rr in crows)
+            real7 = sales7.get(offer_id, 0)
             total_stock = sum(rr["available"] + rr["requested"] + rr["transit"]
                               for rr in crows) or 1
             block = []
             for rr in crows:
-                if has_ads:
-                    sold7 = int(round((rr.get("ads") or 0) * 7))
+                ads_c = rr.get("ads") or 0
+                if real7 and ads_sum:
+                    # настоящая неделя, разложенная по доле кластера в продажах
+                    sold7 = int(round(real7 * ads_c / ads_sum))
+                elif ads_c:
+                    # продаж за неделю нет под рукой — берём темп 28 дней
+                    sold7 = int(round(ads_c * 7))
                 else:
+                    # OZON не дал продаж по кластеру: последнее средство —
+                    # доля в остатках. Хуже, но лучше, чем ноль во всех строках
                     share = (rr["available"] + rr["requested"] + rr["transit"]) / total_stock
-                    sold7 = int(round(sales7.get(offer_id, 0) * share))
-                block.append((rr, sold7))
+                    sold7 = int(round(real7 * share))
+                block.append((rr, sold7, ads_c))
             # внутри артикула кластеры по убыванию продаж — как в образце
             block.sort(key=lambda t: t[1], reverse=True)
-            prepared.append((offer_id, sum(s for _, s in block), block))
+            prepared.append((offer_id, sum(x[1] for x in block), block))
         prepared.sort(key=lambda t: t[1], reverse=True)
 
         r = 1
         for offer_id, _, block in prepared:
-            for rr, sold7 in block:
+            for rr, sold7, ads_c in block:
                 r += 1
                 name = rr.get("name") or offer_id
                 X.style_body_cell(ws.cell(r, 1, value=name))
@@ -756,23 +810,27 @@ def build_stocks(collectors, cfg):
                 X.style_body_cell(ws.cell(r, 7, value=sold7), X.FMT_PLAIN_INT)
                 cc = ws.cell(r, 8, value=f"=G{r}/7")
                 X.style_body_cell(cc); cc.number_format = X.FMT_FLOAT1
-                cc = ws.cell(r, 9, value=f"=H{r}*30-F{r}")
+                # ср/28 дней — как есть от OZON, по этому кластеру
+                X.style_body_cell(ws.cell(r, 9, value=round(ads_c, 1)),
+                                  X.FMT_FLOAT1)
+                cc = ws.cell(r, 10, value=f"=H{r}*30-F{r}")
                 X.style_body_cell(cc); cc.number_format = X.FMT_PLAIN_INT
-                cc = ws.cell(r, 10, value=f"=H{r}*45-F{r}")
+                cc = ws.cell(r, 11, value=f"=H{r}*45-F{r}")
                 X.style_body_cell(cc); cc.number_format = X.FMT_PLAIN_INT
-                cc = ws.cell(r, 11, value=f'=IF(H{r}=0,"",F{r}/H{r})')
+                cc = ws.cell(r, 12, value=f'=IF(H{r}=0,"",F{r}/H{r})')
                 X.style_body_cell(cc); cc.number_format = X.FMT_FLOAT1
 
         if r > 1:
             # правила подсветки строго как в образце
             X.highlight_zero(ws, f"C2:E{r}")          # нет остатка — розовым
             X.highlight_zero(ws, f"F2:F{r}")          # нулевой итог — розовым
-            X.highlight_negative_good(ws, f"I2:J{r}")  # потребность закрыта — зелёным
+            X.highlight_negative_good(ws, f"J2:K{r}")  # потребность закрыта — зелёным
             X.color_scale(ws, f"G2:G{r}")             # прод 7д
             X.color_scale(ws, f"H2:H{r}")             # среднее
-            X.color_scale(ws, f"K2:K{r}")             # на сколько дней хватит
+            X.color_scale(ws, f"I2:I{r}")             # ср/28 дней
+            X.color_scale(ws, f"L2:L{r}")             # на сколько дней хватит
 
-        X.set_widths(ws, [46.25, 30.6, 14.9, 14.9, 14.9, 9, 10, 10, 11, 11, 14.9])
+        X.set_widths(ws, [46.25, 30.6, 14.9, 14.9, 14.9, 9, 10, 10, 11, 11, 11, 14.9])
         ws.freeze_panes = "C2"
         X.page_setup(ws)
 

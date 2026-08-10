@@ -106,6 +106,24 @@ def color_scale(ws, cell_range):
     )
 
 
+def color_scale_inverted(ws, cell_range):
+    """
+    Шкала наоборот: большое значение — красное, малое — зелёное.
+
+    Нужна для ДРР. Обычная шкала красит максимум зелёным, и самый дорогой
+    в рекламе товар выглядел лучше всех — ровно наоборот тому, что значит
+    высокий ДРР.
+    """
+    ws.conditional_formatting.add(
+        cell_range,
+        ColorScaleRule(
+            start_type="min", start_color=SCALE_MAX,
+            mid_type="percentile", mid_value=50, mid_color=SCALE_MID,
+            end_type="max", end_color=SCALE_MIN,
+        ),
+    )
+
+
 def highlight_zero(ws, cell_range):
     """Ноль — розовая заливка с красным текстом (как в образце по остаткам)."""
     ws.conditional_formatting.add(

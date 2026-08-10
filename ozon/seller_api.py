@@ -583,8 +583,15 @@ class SellerAPI:
             "available": _i(it.get("available_stock_count") or it.get("valid_stock_count")),
             "requested": _i(it.get("requested_stock_count")),
             "transit": _i(it.get("transit_stock_count")),
-            "ads": _f(it.get("ads")),
-            "idc": _f(it.get("idc")),
+            # ВАЖНО: ads и idc — «по всем кластерам», ads_cluster и
+            # idc_cluster — по этому кластеру. Отчёт по остаткам считает
+            # потребность на кластер, значит ему нужны вторые. Раньше брались
+            # первые, и во всех строках товара стояло одно и то же число,
+            # а потребность кластера считалась от продаж всего магазина.
+            "ads": _f(it.get("ads_cluster")) or _f(it.get("ads")),
+            "ads_all": _f(it.get("ads")),
+            "idc": _f(it.get("idc_cluster")) or _f(it.get("idc")),
+            "no_sales_days": _i(it.get("days_without_sales_cluster")),
         }
 
     def _cluster_stocks_by_sku(self, skus):
