@@ -69,6 +69,28 @@ COLUMNS = {
                  "position", "position_category"),
 }
 
+# --- второй тип файла: выгрузка ЗАКАЗОВ ---
+# Из неё берутся продажи по КЛАСТЕРУ ДОСТАВКИ. Это принципиально другая
+# величина, чем ads_cluster из API: тот привязан к кластеру, где товар лежит,
+# то есть к отгрузке. Заказчик считает потребность по доставке — куда товар
+# уехал, а не откуда. В API кластера доставки нет ни в одном методе, только
+# в этой выгрузке.
+ORDER_COLUMNS = {
+    "day": ("принят в обработку", "дата отгрузки", "дата", "день"),
+    "offer_id": ("артикул", "ваш sku", "offer id"),
+    "sku": ("sku", "ozon id"),
+    "cluster": ("кластер доставки",),
+    "cluster_ship": ("кластер отгрузки",),
+    "qty": ("количество", "кол-во", "шт"),
+    "status": ("статус",),
+}
+ORDER_ORDER = ("day", "cluster", "cluster_ship", "offer_id", "sku", "qty",
+               "status")
+
+# Отменённые заказы в продажи не идут. Заказчик их убирает руками ещё в
+# кабинете («убрала отмены»), но полагаться на это нельзя.
+CANCELLED = ("отмен", "cancel")
+
 # Колонки, ради которых всё затевается. Файл без единой из них бесполезен.
 VALUE_KEYS = ("views", "sessions", "sessions_pdp", "tocart", "conv_tocart",
               "position")
@@ -206,11 +228,133 @@ def _rows_from_csv(data):
     return [r for r in csv.reader(io.StringIO(text, newline=""), delimiter=delim)]
 
 
+# Выгрузка заказов у заказчика приходит листом на миллион строк, из которых
+# заполнено восемь тысяч: Excel растягивает лист до предела. Читать хвост
+# бессмысленно и дорого, поэтому останавливаемся после длинной череды пустых.
+EMPTY_TAIL = 200
+
+
+# Признаки нужного листа, от самого надёжного к слабому. «Кластер доставки»
+# встречается только в выгрузке заказов, «конверсия в корзину» — только в
+# аналитической. Заказчик прислал рабочую книгу на десять листов, где первым
+# лежал совсем другой лист, поэтому лист выбирается по шапке, а не по номеру.
+SHEET_MARKERS = (
+    ("кластер доставки",),
+    ("конверсия в корзину", "уникальные посетители"),
+    ("в корзину", "показы"),
+)
+
+
+def _pick_sheet(wb):
+    """Лист с нужными данными. Не нашли по приметам — берём первый."""
+    heads = {}
+    for name in wb.sheetnames:
+        cells = []
+        for i, row in enumerate(wb[name].iter_rows(values_only=True)):
+            if i > 4:
+                break
+            cells += [_norm(c) for c in (row or ()) if c]
+        heads[name] = cells
+    for markers in SHEET_MARKERS:
+        for name in wb.sheetnames:
+            if any(any(m in h for h in heads[name]) for m in markers):
+                return wb[name]
+    return wb[wb.sheetnames[0]]
+
+
 def _rows_from_xlsx(data):
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    ws = wb[wb.sheetnames[0]]
-    return [list(r) for r in ws.iter_rows(values_only=True)]
+    ws = _pick_sheet(wb)
+    out, empty = [], 0
+    for row in ws.iter_rows(values_only=True):
+        if row is None or all(c is None or c == "" for c in row):
+            empty += 1
+            if empty >= EMPTY_TAIL:
+                break
+            out.append(list(row) if row else [])
+            continue
+        empty = 0
+        out.append(list(row))
+    while out and all(c is None or c == "" for c in out[-1]):
+        out.pop()
+    return out
+
+
+def _match_by(header, spec, order):
+    """Как _match_columns, но по произвольному словарю ролей."""
+    norm = [_norm(h) for h in header]
+    found, used = {}, set()
+    for role in order:
+        names = spec[role]
+        for i, h in enumerate(norm):
+            if i not in used and h in names:
+                found[role], _ = i, used.add(i)
+                break
+        if role in found:
+            continue
+        for i, h in enumerate(norm):
+            if i not in used and any(n in h for n in names):
+                found[role], _ = i, used.add(i)
+                break
+    return found
+
+
+def looks_like_orders(rows):
+    """Выгрузка заказов? Узнаём по колонке «Кластер доставки»."""
+    for row in rows[:15]:
+        if row and any("кластер доставки" == _norm(c) for c in row):
+            return True
+    return False
+
+
+def parse_orders(rows, source=""):
+    """
+    Выгрузка заказов -> {артикул: {кластер доставки: {день: штук}}}.
+
+    Отменённые пропускаются. День берётся из «Принят в обработку» — именно
+    по нему заказчик считает свою неделю.
+    """
+    head, cols = -1, {}
+    for i, row in enumerate(rows[:15]):
+        if not row:
+            continue
+        c = _match_by(row, ORDER_COLUMNS, ORDER_ORDER)
+        if "cluster" in c and "day" in c and ("offer_id" in c or "sku" in c):
+            head, cols = i, c
+            break
+    if head < 0:
+        raise CabinetImportError(
+            f"{source}: похоже на выгрузку заказов, но не нашёл разом "
+            f"«Кластер доставки», «Принят в обработку» и «Артикул»")
+
+    out, skipped = {}, 0
+    for row in rows[head + 1:]:
+        if not row:
+            continue
+
+        def cell(role):
+            i = cols.get(role)
+            return row[i] if i is not None and i < len(row) else None
+
+        st = _norm(cell("status"))
+        if st and any(w in st for w in CANCELLED):
+            skipped += 1
+            continue
+        key = str(cell("offer_id") or "").strip() or str(cell("sku") or "").strip()
+        cluster = str(cell("cluster") or "").strip()
+        day = _day(cell("day"))
+        if not key or not cluster or not day:
+            continue
+        qty = _num(cell("qty")) if "qty" in cols else 1.0
+        out.setdefault(key, {}).setdefault(cluster, {})
+        out[key][cluster][day] = out[key][cluster].get(day, 0.0) + (qty or 1.0)
+
+    if not out:
+        raise CabinetImportError(f"{source}: заказы разобраны, но строк нет")
+    if skipped:
+        log.info("%s: пропущено отменённых строк: %d", source, skipped)
+    return out
 
 
 def _find_header(rows, default_day=""):
@@ -320,8 +464,10 @@ def parse_file(data, name=""):
         rows = _rows_from_xlsx(data)
     else:
         rows = _rows_from_csv(data)
-    return parse_rows(rows, source=name or "файл",
-                      default_day=day_from_name(name))
+    if looks_like_orders(rows):
+        return "orders", parse_orders(rows, source=name or "файл")
+    return "metrics", parse_rows(rows, source=name or "файл",
+                                 default_day=day_from_name(name))
 
 
 # ------------------------------------------------------------------ источники
@@ -339,6 +485,19 @@ def _merge(dst, src):
     return dst
 
 
+def _merge_orders(dst, src):
+    """Заказы из разных файлов: слияние на два уровня, артикул -> кластер."""
+    for key, clusters in (src or {}).items():
+        tgt = dst.setdefault(key, {})
+        for cluster, days in clusters.items():
+            tgt.setdefault(cluster, {}).update(days)
+    return dst
+
+
+def _empty():
+    return {"metrics": {}, "orders": {}}
+
+
 def _local_files(folder):
     if not os.path.isdir(folder):
         return []
@@ -350,23 +509,31 @@ def _local_files(folder):
 
 
 def load_local(store_name, data_dir):
-    """Все файлы из DATA_DIR/import/<Магазин>/ — по файлу на день."""
-    out, days, bad = {}, set(), 0
+    """Все файлы из DATA_DIR/import/<Магазин>/ — метрики и заказы."""
+    out, days, bad, n_ord = _empty(), set(), 0, 0
     for path in _local_files(os.path.join(data_dir, "import", store_name)):
         name = os.path.basename(path)
         try:
             with open(path, "rb") as f:
-                part = parse_file(f.read(), name)
+                kind, part = parse_file(f.read(), name)
         except CabinetImportError as e:
             bad += 1
             log.warning("[%s] %s", store_name, e)
             continue
-        days |= {d for v in part.values() for d in v}
-        _merge(out, part)
-    if out:
-        log.info("[%s] выгрузка кабинета: файлов %d, дней %d, товаров %d",
-                 store_name, len(days) if days else 0, len(days), len(out))
-    elif bad:
+        if kind == "orders":
+            _merge_orders(out["orders"], part)
+            n_ord += 1
+        else:
+            days |= {d for v in part.values() for d in v}
+            _merge(out["metrics"], part)
+    if out["metrics"]:
+        log.info("[%s] выгрузка кабинета: дней %d, товаров %d",
+                 store_name, len(days), len(out["metrics"]))
+    if out["orders"]:
+        log.info("[%s] выгрузка заказов: файлов %d, товаров %d "
+                 "(продажи по кластеру доставки)",
+                 store_name, n_ord, len(out["orders"]))
+    if not out["metrics"] and not out["orders"] and bad:
         log.warning("[%s] ни один файл выгрузки прочитать не удалось", store_name)
     return out
 
@@ -403,7 +570,7 @@ def load_drive(store_name, folder_id, credentials_file):
         log.info("[%s] подпапка на Диске пуста — пропускаю", store_name)
         return {}
 
-    out, days, bad = {}, set(), 0
+    out, days, bad, n_ord = _empty(), set(), 0, 0
     for f in files:
         if f["mimeType"] == "application/vnd.google-apps.spreadsheet":
             data = drive.files().export(fileId=f["id"], mimeType="text/csv").execute()
@@ -413,18 +580,26 @@ def load_drive(store_name, folder_id, credentials_file):
             data = data.execute() if hasattr(data, "execute") else data
             name = f["name"]
         try:
-            part = parse_file(data, name)
+            kind, part = parse_file(data, name)
         except CabinetImportError as e:
             bad += 1
             log.warning("[%s] %s", store_name, e)
             continue
-        days |= {d for v in part.values() for d in v}
-        _merge(out, part)
+        if kind == "orders":
+            _merge_orders(out["orders"], part)
+            n_ord += 1
+        else:
+            days |= {d for v in part.values() for d in v}
+            _merge(out["metrics"], part)
 
-    if out:
-        log.info("[%s] выгрузка кабинета с Диска: файлов %d, дней %d, товаров %d",
-                 store_name, len(files) - bad, len(days), len(out))
-    elif bad:
+    if out["metrics"]:
+        log.info("[%s] выгрузка кабинета с Диска: дней %d, товаров %d",
+                 store_name, len(days), len(out["metrics"]))
+    if out["orders"]:
+        log.info("[%s] выгрузка заказов с Диска: файлов %d, товаров %d "
+                 "(продажи по кластеру доставки)",
+                 store_name, n_ord, len(out["orders"]))
+    if not out["metrics"] and not out["orders"] and bad:
         log.warning("[%s] на Диске %d файлов, но ни один не прочитан", store_name, bad)
     return out
 
@@ -440,7 +615,7 @@ def load(store_name, cfg):
     if folder and creds and os.path.exists(creds):
         try:
             data = load_drive(store_name, folder, creds)
-            if data:
+            if data["metrics"] or data["orders"]:
                 return data
         except CabinetImportError as e:
             log.warning("[%s] выгрузку с Диска не разобрал: %s", store_name, e)
@@ -451,4 +626,4 @@ def load(store_name, cfg):
         return load_local(store_name, getattr(cfg, "DATA_DIR", "data"))
     except CabinetImportError as e:
         log.warning("[%s] локальную выгрузку не разобрал: %s", store_name, e)
-        return {}
+        return _empty()

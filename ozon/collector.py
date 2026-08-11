@@ -203,14 +203,26 @@ class StoreCollector:
         return result, order
 
     def cabinet_data(self):
-        """Выгрузка из личного кабинета, если её положили. Читается один раз."""
+        """Метрики из выгрузки кабинета. Папка читается один раз за прогон."""
+        return self._cabinet_all().get("metrics") or {}
+
+    def cabinet_orders(self):
+        """
+        {артикул: {кластер доставки: {день: штук}}} из выгрузки заказов.
+
+        Нужны отчёту по остаткам: потребность считается по кластеру ДОСТАВКИ,
+        а ads_cluster из API привязан к кластеру отгрузки — это разные вещи.
+        """
+        return self._cabinet_all().get("orders") or {}
+
+    def _cabinet_all(self):
         if self._cabinet is None:
             try:
-                self._cabinet = CAB.load(self.name, self.cfg) or {}
+                self._cabinet = CAB.load(self.name, self.cfg) or CAB._empty()
             except Exception as e:      # источник необязательный, сбор важнее
                 log.warning("[%s] выгрузку кабинета прочитать не удалось: %s",
                             self.name, str(e)[:200])
-                self._cabinet = {}
+                self._cabinet = CAB._empty()
         return self._cabinet
 
     def products_for_period(self, date_from, date_to, only_in_stock=True,

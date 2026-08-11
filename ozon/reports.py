@@ -736,7 +736,26 @@ def build_stocks(collectors, cfg):
     for colr in collectors:
         rows = colr.cluster_stocks()
 
-        # продажи за 7 дней по артикулу — их и раскладываем по кластерам
+        # Продажи за 7 дней по КЛАСТЕРУ ДОСТАВКИ — из выгрузки заказов, если
+        # её положили. Это то, что просил заказчик: считать надо по тому, куда
+        # товар уехал, а не откуда отгрузили. В API такого разреза нет вовсе.
+        day_keys7 = set(D.d(x) for x in _daterange(date_from, date_to))
+        orders = {}
+        try:
+            raw = getattr(colr, "cabinet_orders", lambda: {})() or {}
+            for offer, by_cluster in raw.items():
+                for cluster, days in by_cluster.items():
+                    qty = sum(v for d, v in days.items() if d in day_keys7)
+                    if qty:
+                        orders.setdefault(offer, {})[cluster] = qty
+            if orders:
+                log.info("[%s] продажи по кластеру доставки из выгрузки заказов: "
+                         "товаров %d", colr.name, len(orders))
+        except Exception as e:
+            log.warning("[%s] выгрузку заказов не разобрал: %s",
+                        colr.name, str(e)[:200])
+
+        # продажи за 7 дней по артикулу — запасной путь, если заказов нет
         sales7 = {}
         try:
             prods = colr.products_for_period(date_from, date_to, only_in_stock=True,
@@ -789,12 +808,17 @@ def build_stocks(collectors, cfg):
         for offer_id, crows in by_offer.items():
             ads_sum = sum(rr.get("ads") or 0 for rr in crows)
             real7 = sales7.get(offer_id, 0)
+            by_cluster = orders.get(offer_id) or {}
             total_stock = sum(rr["available"] + rr["requested"] + rr["transit"]
                               for rr in crows) or 1
             block = []
             for rr in crows:
                 ads_c = rr.get("ads") or 0
-                if real7 and ads_sum:
+                if by_cluster:
+                    # лучший источник: сколько штук реально уехало в этот
+                    # кластер за неделю, без всяких пропорций
+                    sold7 = int(round(by_cluster.get(rr.get("cluster", ""), 0)))
+                elif real7 and ads_sum:
                     # настоящая неделя, разложенная по доле кластера в продажах
                     sold7 = int(round(real7 * ads_c / ads_sum))
                 elif ads_c:

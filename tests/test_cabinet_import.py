@@ -87,7 +87,7 @@ except CAB.CabinetImportError as e:
 
 print("\n6. csv с точкой с запятой")
 data = "Дата;Артикул;Показы;В корзину\n2026-08-05;ART-2;300;12\n".encode("utf-8")
-out6 = CAB.parse_file(data, "v.csv")
+_, out6 = CAB.parse_file(data, "v.csv")
 check("csv разобран", out6["ART-2"]["2026-08-05"]["tocart"] == 12.0, out6)
 
 print("\n7. xlsx читается по байтам")
@@ -97,7 +97,7 @@ ws.append(["Дата", "Артикул", "Показы", "В корзину"])
 ws.append([_dt.date(2026, 8, 5), "ART-3", 700, 33])
 buf = io.BytesIO()
 wb.save(buf)
-out7 = CAB.parse_file(buf.getvalue(), "v.xlsx")
+_, out7 = CAB.parse_file(buf.getvalue(), "v.xlsx")
 check("дата-объект из ячейки понята",
       out7["ART-3"]["2026-08-05"]["views"] == 700.0, out7)
 
@@ -161,7 +161,8 @@ check("пустых строк не осталось",
 
 print("\n12. Нет файла — сбор не падает")
 check("пустая папка даёт пустой результат",
-      CAB.load_local("НЕТ ТАКОГО", "/tmp/нет-такой-папки") == {})
+      CAB.load_local("НЕТ ТАКОГО", "/tmp/нет-такой-папки")
+      == {"metrics": {}, "orders": {}})
 
 
 class CfgNoGoogle:
@@ -171,7 +172,7 @@ class CfgNoGoogle:
 
 
 check("load() без настроек возвращает пусто, а не исключение",
-      CAB.load("ТЕСТ", CfgNoGoogle()) == {})
+      CAB.load("ТЕСТ", CfgNoGoogle()) == {"metrics": {}, "orders": {}})
 
 print("\n13. Сноска называет решение, а не только причину")
 from openpyxl import Workbook as _WB
@@ -310,7 +311,7 @@ _wb = _W(); _ws2 = _wb.active
 for r in no_date:
     _ws2.append(r)
 _buf = _io.BytesIO(); _wb.save(_buf)
-out = CAB.parse_file(_buf.getvalue(), "2026-08-08.xlsx")
+_, out = CAB.parse_file(_buf.getvalue(), "2026-08-08.xlsx")
 check("день взят из имени", list(out["ART-1"]) == ["2026-08-08"], out)
 check("корзина посчитана", abs(out["ART-1"]["2026-08-08"]["tocart"] - 60) < 0.01,
       out["ART-1"]["2026-08-08"]["tocart"])
@@ -332,7 +333,7 @@ for _i, _d in enumerate(["2026-08-05", "2026-08-06", "2026-08-07"]):
     _w.append(["ART-1", 100 + _i, 10 + _i])
     _wb.save(_os.path.join(_folder, f"{_d}.xlsx"))
     _t.sleep(0.02)
-res = CAB.load_local("ТЕСТ", "/tmp/_cabtest")
+res = CAB.load_local("ТЕСТ", "/tmp/_cabtest")["metrics"]
 check("собраны все три дня",
       sorted(res["ART-1"]) == ["2026-08-05", "2026-08-06", "2026-08-07"],
       sorted(res.get("ART-1", {})))
@@ -343,7 +344,7 @@ check("числа не перепутались между днями",
 # битый файл не должен утаскивать за собой остальные
 _wb = _W(); _wb.active.append(["ничего", "полезного"])
 _wb.save(_os.path.join(_folder, "мусор.xlsx"))
-res = CAB.load_local("ТЕСТ", "/tmp/_cabtest")
+res = CAB.load_local("ТЕСТ", "/tmp/_cabtest")["metrics"]
 check("нечитаемый файл пропущен, остальные разобраны",
       len(res["ART-1"]) == 3, sorted(res.get("ART-1", {})))
 _sh.rmtree("/tmp/_cabtest", ignore_errors=True)
