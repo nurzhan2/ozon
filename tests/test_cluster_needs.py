@@ -171,5 +171,82 @@ check("разница показов без пары дней — пусто",
       d[0][1]["hits_view"] is None, d[0][1]["hits_view"])
 check("разница по деньгам считается", d[0][1]["revenue"] == 0, d[0][1]["revenue"])
 
+print("\n8. Один кластер — одна строка, склады складываются")
+WAREHOUSES = []
+for w, av, tr in [("W1", 0, 0), ("W2", 0, 1), ("W3", 1, 0), ("W4", 399, 0),
+                  ("W5", 77, 0), ("W6", 0, 500), ("W7", 2, 0)]:
+    WAREHOUSES.append({
+        "offer_id": "Мазь VARICOSE",
+        "name": "Мазь от варикоза вен на ногах, крем венотоник от отеков",
+        "cluster": "Москва, МО и Дальние регионы", "warehouse": w,
+        "available": av, "requested": 0, "transit": tr, "ads": 18.6, "idc": 5.0})
+WAREHOUSES.append({
+    "offer_id": "Мазь VARICOSE", "name": "Мазь от варикоза", "cluster": "Ростов",
+    "warehouse": "W8", "available": 400, "requested": 0, "transit": 0,
+    "ads": 8.7, "idc": 9.0})
+
+
+class Store2(Store):
+    def __init__(self):
+        super().__init__(rows=WAREHOUSES, sales=191)
+
+    def products_for_period(self, a, b, only_in_stock=True, with_kpi=True):
+        return {"Мазь VARICOSE": {"offer_id": "Мазь VARICOSE",
+                                  "ordered_units": self.sales}}
+
+
+ws2 = load_workbook(R.build_stocks([Store2()], Cfg()))["ТЕСТ"]
+rows2 = {ws2.cell(r, 2).value: r for r in range(2, ws2.max_row + 1)
+         if ws2.cell(r, 2).value}
+check("восемь складских строк свернулись в два кластера",
+      ws2.max_row - 1 == 2, ws2.max_row - 1)
+check("кластер назван один раз", set(rows2) == {"Москва, МО и Дальние регионы",
+                                               "Ростов"}, set(rows2))
+msk = rows2["Москва, МО и Дальние регионы"]
+check("«доступно» просуммировано по складам",
+      ws2.cell(msk, 3).value == 479, ws2.cell(msk, 3).value)
+check("«в пути» просуммировано", ws2.cell(msk, 5).value == 501,
+      ws2.cell(msk, 5).value)
+check("ср/28 НЕ просуммирован — он и так на весь кластер",
+      ws2.cell(msk, 9).value == 18.6, ws2.cell(msk, 9).value)
+check("продажи недели поделены между двумя кластерами",
+      ws2.cell(msk, 7).value == 130
+      and ws2.cell(rows2["Ростов"], 7).value == 61,
+      (ws2.cell(msk, 7).value, ws2.cell(rows2["Ростов"], 7).value))
+
+print("\n9. В колонке «Артикул» — артикул, а не длинное наименование")
+check("артикул", ws2.cell(msk, 1).value == "Мазь VARICOSE", ws2.cell(msk, 1).value)
+check("длинное наименование не попало",
+      "венотоник" not in str(ws2.cell(msk, 1).value), ws2.cell(msk, 1).value)
+
+print("\n10. Расписание: у утреннего пакета есть минуты")
+import importlib
+import datetime as _dt
+os.environ["MORNING_HOUR"] = "9"
+os.environ["MORNING_MINUTE"] = "45"
+os.environ["INTRADAY_HOURS"] = "12,16"
+import worker
+importlib.reload(worker)
+check("минута прочитана", worker.MORNING_MINUTE == 45, worker.MORNING_MINUTE)
+moment, kinds = worker.next_run_after(_dt.datetime(2026, 8, 11, 7, 0))
+check("утренний пакет в 09:45",
+      (moment.hour, moment.minute) == (9, 45), (moment.hour, moment.minute))
+check("и это именно morning", kinds == ["morning"], kinds)
+moment, kinds = worker.next_run_after(_dt.datetime(2026, 8, 11, 10, 0))
+check("следующий — промежуточный в 12:00",
+      (moment.hour, moment.minute, kinds) == (12, 0, ["intraday"]),
+      (moment.hour, moment.minute, kinds))
+moment, kinds = worker.next_run_after(_dt.datetime(2026, 8, 11, 20, 0))
+check("после последнего часа переходим на утро следующего дня",
+      (moment.day, moment.hour, moment.minute) == (12, 9, 45),
+      (moment.day, moment.hour, moment.minute))
+
+os.environ["MORNING_MINUTE"] = "0"
+os.environ["MORNING_HOUR"] = "12"
+importlib.reload(worker)
+moment, kinds = worker.next_run_after(_dt.datetime(2026, 8, 11, 7, 0))
+check("совпадение часа с промежуточным даёт оба вида",
+      sorted(kinds) == ["intraday", "morning"], kinds)
+
 print("\nИТОГ:", "все проверки пройдены" if ok else "ЕСТЬ ПРОВАЛЫ")
 sys.exit(0 if ok else 1)

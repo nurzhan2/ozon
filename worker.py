@@ -42,6 +42,10 @@ log = logging.getLogger("worker")
 TZ = ZoneInfo(config.TIMEZONE) if ZoneInfo else None
 
 MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "8"))
+# Минуты у утреннего пакета: заказчик кладёт выгрузку из кабинета около 9:30,
+# и сбор должен стартовать ПОСЛЕ этого, иначе свежий день соберётся без
+# корзины. Часа для такой настройки не хватает.
+MORNING_MINUTE = max(0, min(59, int(os.environ.get("MORNING_MINUTE", "0"))))
 INTRADAY_HOURS = [int(h) for h in
                   os.environ.get("INTRADAY_HOURS", "8,10,12,14,16,18,20,22").split(",")
                   if h.strip()]
@@ -101,15 +105,17 @@ def next_run_after(dt):
     candidates = []
     for day_shift in (0, 1):
         base = (dt + timedelta(days=day_shift)).replace(minute=0, second=0, microsecond=0)
-        for h in sorted(set(INTRADAY_HOURS + [MORNING_HOUR])):
+        # утренний пакет — со своей минутой, промежуточные — ровно по часам
+        morning = base.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE)
+        if morning > dt:
+            kinds = ["morning"]
+            if MORNING_HOUR in INTRADAY_HOURS and MORNING_MINUTE == 0:
+                kinds.append("intraday")
+            candidates.append((morning, kinds))
+        for h in sorted(set(INTRADAY_HOURS)):
             moment = base.replace(hour=h)
-            if moment > dt:
-                kinds = []
-                if h == MORNING_HOUR:
-                    kinds.append("morning")
-                if h in INTRADAY_HOURS:
-                    kinds.append("intraday")
-                candidates.append((moment, kinds))
+            if moment > dt and moment != morning:
+                candidates.append((moment, ["intraday"]))
     candidates.sort(key=lambda x: x[0])
     return candidates[0]
 
@@ -118,8 +124,9 @@ def startup_check():
     log.info("Часовой пояс: %s, сейчас %s", config.TIMEZONE, now().strftime("%Y-%m-%d %H:%M"))
     log.info("Магазинов в конфигурации: %d (%s)",
              len(config.STORES), ", ".join(s["name"] for s in config.STORES))
-    log.info("Утренний пакет в %02d:00; промежуточный в %s",
-             MORNING_HOUR, ", ".join(f"{h:02d}:00" for h in INTRADAY_HOURS))
+    log.info("Утренний пакет в %02d:%02d; промежуточный в %s",
+             MORNING_HOUR, MORNING_MINUTE,
+             ", ".join(f"{h:02d}:00" for h in INTRADAY_HOURS))
     log.info("Данные: %s | выгрузка в Google: %s",
              config.DATA_DIR, "включена" if config.UPLOAD_TO_GOOGLE else "выключена")
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)

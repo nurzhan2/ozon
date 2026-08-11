@@ -759,9 +759,29 @@ def build_stocks(collectors, cfg):
             else:
                 X.style_header_cell(cell, yellow=True)
 
+        # Одна строка на кластер. OZON отдаёт строку на СКЛАД, а кластер
+        # повторяется по нескольку раз — у «Москва, МО и Дальние регионы»
+        # выходило девять строк на один товар. Заказчику нужен кластер целиком:
+        # остатки складываем, а ads_cluster и idc_cluster НЕ складываем —
+        # они и так посчитаны на весь кластер, во всех его строках одинаковы.
+        merged = {}
+        for rr in rows:
+            key = (rr["offer_id"], rr.get("cluster", ""))
+            cur = merged.get(key)
+            if cur is None:
+                merged[key] = dict(rr)
+                continue
+            for f in ("available", "requested", "transit"):
+                cur[f] += rr.get(f, 0) or 0
+            for f in ("ads", "idc", "ads_all"):
+                if not cur.get(f):
+                    cur[f] = rr.get(f) or 0
+            if not cur.get("name"):
+                cur["name"] = rr.get("name", "")
+
         # группируем по артикулу
         by_offer = {}
-        for rr in rows:
+        for rr in merged.values():
             by_offer.setdefault(rr["offer_id"], []).append(rr)
 
         # считаем «прод 7д» заранее, чтобы отсортировать кластеры по нему
@@ -795,8 +815,9 @@ def build_stocks(collectors, cfg):
         for offer_id, _, block in prepared:
             for rr, sold7, ads_c in block:
                 r += 1
-                name = rr.get("name") or offer_id
-                X.style_body_cell(ws.cell(r, 1, value=name))
+                # Именно артикул: наименования у заказчика по 120 символов,
+                # и колонка становилась нечитаемой. Просил артикул.
+                X.style_body_cell(ws.cell(r, 1, value=offer_id or rr.get("name", "")))
                 ws.cell(r, 1).alignment = X.LEFT
                 X.style_body_cell(ws.cell(r, 2, value=rr.get("cluster", "")))
                 ws.cell(r, 2).alignment = X.LEFT
@@ -830,7 +851,7 @@ def build_stocks(collectors, cfg):
             X.color_scale(ws, f"I2:I{r}")             # ср/28 дней
             X.color_scale(ws, f"L2:L{r}")             # на сколько дней хватит
 
-        X.set_widths(ws, [46.25, 30.6, 14.9, 14.9, 14.9, 9, 10, 10, 11, 11, 11, 14.9])
+        X.set_widths(ws, [34, 30.6, 14.9, 14.9, 14.9, 9, 10, 10, 11, 11, 11, 14.9])
         ws.freeze_panes = "C2"
         X.page_setup(ws)
 
