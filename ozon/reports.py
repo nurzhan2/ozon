@@ -73,6 +73,20 @@ def _safe_div(a, b):
     return (a / b) if b else 0.0
 
 
+def _label(rec):
+    """
+    Подпись товара во всех отчётах — АРТИКУЛ.
+
+    Наименования у заказчика по сто с лишним символов («Мазь от варикоза вен
+    на ногах, крем венотоник от отёков…»), и первая колонка становилась
+    нечитаемой. В отчёте 4 он попросил заменить её на артикул, а потом
+    заметил, что в остальных четырёх наименования остались. Теперь везде
+    одинаково. Артикула нет — падаем на наименование: пустой первой колонки
+    быть не должно.
+    """
+    return rec.get("offer_id") or rec.get("name") or ""
+
+
 # ============================================================ 1. Общая сводная
 
 def build_cumulative_sales(collectors, cfg):
@@ -98,7 +112,7 @@ def build_cumulative_sales(collectors, cfg):
             total = sum(per_day)
             if total <= 0:
                 continue
-            rows.append((rec["name"] or rec["offer_id"], per_day, total))
+            rows.append((_label(rec), per_day, total))
         rows.sort(key=lambda x: x[2], reverse=True)
 
         # --- шапка блока ---
@@ -278,9 +292,9 @@ def _build_dod_like(collectors, cfg, cur_from, cur_to, prev_from, prev_to,
         v_days = getattr(colr, "days_with_views", set()) or set()
         cur_v = any(k in v_days for k in cur_keys)
         prev_v = any(k in v_days for k in prev_keys)
-        cur_rows = [(r["name"] or r["offer_id"], _agg(r, cur_keys, cur_v))
+        cur_rows = [(_label(r), _agg(r, cur_keys, cur_v))
                     for r in cur_daily.values()]
-        prev_rows = [(r["name"] or r["offer_id"], _agg(r, prev_keys, prev_v))
+        prev_rows = [(_label(r), _agg(r, prev_keys, prev_v))
                      for r in prev_daily.values()]
         cur_rows, prev_rows = _align_blocks(cur_rows, prev_rows)
 
@@ -334,7 +348,7 @@ def build_intraday(collectors, cfg, snapshots_dir=None):
         cur_keys = [D.d(today)]
         v_days = getattr(colr, "days_with_views", set()) or set()
         # за сегодня показов у OZON заведомо ещё нет — колонка будет пустой
-        cur_rows = [(r["name"] or r["offer_id"],
+        cur_rows = [(_label(r),
                      _agg(r, cur_keys, D.d(today) in v_days))
                     for r in cur_daily.values()]
 
@@ -343,12 +357,24 @@ def build_intraday(collectors, cfg, snapshots_dir=None):
                {n: v for n, v in cur_rows})
 
         snap = S.load(snapshots_dir, colr.name, D.d(yday), hour)
+        # Снимки подписаны так же, как строки отчёта. Пока подписью было
+        # наименование, вчерашние снимки лежат с наименованиями, а сегодня
+        # строки уже с артикулами — при сравнении «в лоб» каждый товар
+        # раздвоился бы: строка с наименованием и нулями и строка с артикулом.
+        # Ни одного общего ключа — считаем, что снимка нет; через сутки
+        # накопятся новые, и ветка перестанет срабатывать сама.
+        if snap and cur_rows and not (set(snap) & {n for n, _ in cur_rows}):
+            log.info("[%s] вчерашний снимок на %02d:00 сделан со старыми "
+                     "подписями — сравниваю с полным вчерашним днём",
+                     colr.name, hour)
+            snap = None
+
         if snap is not None:
             prev_rows = [(n, v) for n, v in snap.items()]
             note = ""
         else:
             prev_daily, _ = colr.daily_by_product(yday, yday, only_in_stock=True)
-            prev_rows = [(r["name"] or r["offer_id"],
+            prev_rows = [(_label(r),
                           _agg(r, [D.d(yday)], D.d(yday) in v_days))
                          for r in prev_daily.values()]
             note = " (снимка за вчера на этот час нет — сравнение с полным вчерашним днём)"
@@ -646,7 +672,7 @@ def build_quality(collectors, cfg):
             if not any(v["hits_view"] or v["revenue"] or v["ad_spend"]
                        for v in vals_by_day.values()):
                 continue
-            r = _quality_write_block(ws, r, rec["name"] or rec["offer_id"], days,
+            r = _quality_write_block(ws, r, _label(rec), days,
                                      vals_by_day, day_keys, with_total,
                                      rows_def, unified)
 
