@@ -6,14 +6,21 @@
 """
 
 import logging
+import os
 
 from .seller_api import SellerAPI, SellerAPIError, METRICS_REPORT
-from .performance_api import PerformanceAPI
+from .performance_api import (PerformanceAPI, CACHE_DIR, _safe_name,
+                              _read_json, _write_json)
 from . import processing as P
 from . import cabinet as CAB
 from . import dates as D
 
 log = logging.getLogger("ozon.collector")
+
+
+def _cluster_map_path(store_name):
+    """Где лежит карта «склад -> кластер». DATA_DIR переживает деплой."""
+    return os.path.join(CACHE_DIR, f"clusters_{_safe_name(store_name)}.json")
 
 
 def _days_between(date_from, date_to):
@@ -142,9 +149,11 @@ class StoreCollector:
                          self.name, len(sku_map))
                 rows = self.seller.cluster_stocks(skus=list(sku_map))
                 log.info("[%s] кластерных строк: %d", self.name, len(rows))
+                self._save_cluster_map(rows)
             except SellerAPIError as e:
-                log.warning("[%s] кластерный метод недоступен (%s), беру склады", self.name, e)
-                rows = self.seller.stocks_on_warehouses()
+                log.warning("[%s] кластерный метод недоступен (%s), беру склады",
+                            self.name, e)
+                rows = self._warehouses_as_clusters()
             names = self.offer_names()
             for r in rows:
                 if not r.get("name"):
@@ -154,6 +163,73 @@ class StoreCollector:
                 if not P.is_excluded(r.get("offer_id", ""), self.exclude_marker)
             ]
         return self._cluster_rows
+
+    def _save_cluster_map(self, rows):
+        """
+        Запоминает, какой склад к какому кластеру относится, и среднесуточные
+        продажи кластера. Карта меняется редко — OZON не переносит склады
+        между кластерами каждый день, — поэтому вчерашняя годится сегодня.
+        """
+        wh, ads = {}, {}
+        for r in rows:
+            cluster = (r.get("cluster") or "").strip()
+            if not cluster:
+                continue
+            w = (r.get("warehouse") or "").strip()
+            if w:
+                wh[w] = cluster
+            key = f"{r.get('offer_id', '')}\t{cluster}"
+            if key not in ads:
+                ads[key] = [r.get("ads") or 0.0, r.get("idc") or 0.0,
+                            r.get("ads_all") or 0.0]
+        if wh:
+            _write_json(_cluster_map_path(self.name), {"warehouses": wh, "ads": ads})
+
+    def _warehouses_as_clusters(self):
+        """
+        Запасной путь, когда /v1/analytics/stocks отбил 429 все семь попыток.
+
+        Раньше сюда просто подставлялось имя склада вместо кластера, и в
+        отчёте вместо «Москва, МО и Дальние регионы» появлялись УФА_РФЦ,
+        ПУШКИНО_2_РФЦ и ещё три десятка строк на товар — заказчик это увидел
+        первым же утром. Остатки при этом были правильные: сломалась только
+        группировка.
+
+        Поэтому берём свежие остатки по складам, а группировку — из карты,
+        сохранённой в прошлый удачный прогон. Оттуда же ads_cluster, иначе
+        «прод 7д» и потребность считать не от чего.
+        """
+        rows = self.seller.stocks_on_warehouses()
+        cache = _read_json(_cluster_map_path(self.name), {}) or {}
+        wh = cache.get("warehouses") or {}
+        ads = cache.get("ads") or {}
+        if not wh:
+            log.warning("[%s] карты «склад -> кластер» ещё нет — в отчёте "
+                        "будут склады. Появится после первого удачного "
+                        "кластерного прогона", self.name)
+            return rows
+
+        unknown, merged = set(), {}
+        for r in rows:
+            w = (r.get("warehouse") or "").strip()
+            cluster = wh.get(w)
+            if not cluster:
+                unknown.add(w)
+                cluster = w
+            key = (r.get("offer_id", ""), cluster)
+            cur = merged.get(key)
+            if cur is None:
+                a = ads.get(f"{r.get('offer_id', '')}\t{cluster}") or [0.0, 0.0, 0.0]
+                r = dict(r, cluster=cluster, ads=a[0], idc=a[1], ads_all=a[2])
+                merged[key] = r
+                continue
+            for f in ("available", "requested", "transit"):
+                cur[f] += r.get(f, 0) or 0
+
+        log.info("[%s] кластеры восстановлены из сохранённой карты: складов "
+                 "%d -> строк %d%s", self.name, len(rows), len(merged),
+                 f", без кластера осталось складов: {len(unknown)}" if unknown else "")
+        return list(merged.values())
 
     # ---------------- аналитика ----------------
     def daily_by_product(self, date_from, date_to, only_in_stock=True):
