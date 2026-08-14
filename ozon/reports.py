@@ -862,7 +862,37 @@ def build_stocks(collectors, cfg):
         prepared.sort(key=lambda t: t[1], reverse=True)
 
         r = 1
+        body = []      # диапазоны строк с кластерами — для шкал и подсветки
         for offer_id, _, block in prepared:
+            # Итоговая строка по позиции, над разбивкой по кластерам:
+            # «общий сток, общая заявка, в пути, общие продажи за семь дней».
+            # Всё формулами SUM по блоку ниже — видно, что это ровно сумма
+            # того, что под ней, и пересчитается, если заказчик что-то правит
+            # руками.
+            r += 1
+            t = r
+            first, last = r + 1, r + len(block)
+            X.style_header_cell(ws.cell(t, 1, value=offer_id), yellow=True)
+            ws.cell(t, 1).alignment = X.LEFT
+            X.style_header_cell(ws.cell(t, 2, value="все кластеры"), yellow=True)
+            ws.cell(t, 2).alignment = X.LEFT
+            for c in (3, 4, 5, 9):
+                letter = X.col(c)
+                cc = ws.cell(t, c, value=f"=SUM({letter}{first}:{letter}{last})")
+                X.style_header_cell(cc, yellow=True)
+                cc.number_format = X.FMT_PLAIN_INT if c != 9 else X.FMT_FLOAT1
+            for c, formula, fmt in (
+                    (6, f"=C{t}+D{t}+E{t}", X.FMT_PLAIN_INT),
+                    (7, f"=SUM(G{first}:G{last})", X.FMT_PLAIN_INT),
+                    (8, f"=G{t}/7", X.FMT_FLOAT1),
+                    (10, f"=H{t}*30-F{t}", X.FMT_PLAIN_INT),
+                    (11, f"=H{t}*45-F{t}", X.FMT_PLAIN_INT),
+                    (12, f'=IF(H{t}=0,"",F{t}/H{t})', X.FMT_FLOAT1)):
+                cc = ws.cell(t, c, value=formula)
+                X.style_header_cell(cc, yellow=True)
+                cc.number_format = fmt
+
+            body.append((first, last))
             for rr, sold7, ads_c in block:
                 r += 1
                 # Именно артикул: наименования у заказчика по 120 символов,
@@ -891,15 +921,22 @@ def build_stocks(collectors, cfg):
                 cc = ws.cell(r, 12, value=f'=IF(H{r}=0,"",F{r}/H{r})')
                 X.style_body_cell(cc); cc.number_format = X.FMT_FLOAT1
 
-        if r > 1:
-            # правила подсветки строго как в образце
-            X.highlight_zero(ws, f"C2:E{r}")          # нет остатка — розовым
-            X.highlight_zero(ws, f"F2:F{r}")          # нулевой итог — розовым
-            X.highlight_negative_good(ws, f"J2:K{r}")  # потребность закрыта — зелёным
-            X.color_scale(ws, f"G2:G{r}")             # прод 7д
-            X.color_scale(ws, f"H2:H{r}")             # среднее
-            X.color_scale(ws, f"I2:I{r}")             # ср/28 дней
-            X.color_scale(ws, f"L2:L{r}")             # на сколько дней хватит
+        if body:
+            # Итоговые строки в шкалы и подсветку не входят: сумма по позиции
+            # всегда больше любого своего кластера, и цветовая шкала, посчитанная
+            # вместе с ней, красила бы все кластеры одинаково бледным. Диапазоны
+            # перечисляются через пробел — Excel понимает такую запись.
+            def rng(c1, c2=None):
+                a, b = X.col(c1), X.col(c2 or c1)
+                return " ".join(f"{a}{f}:{b}{l}" for f, l in body)
+
+            X.highlight_zero(ws, rng(3, 5))            # нет остатка — розовым
+            X.highlight_zero(ws, rng(6))               # нулевой итог — розовым
+            X.highlight_negative_good(ws, rng(10, 11))  # потребность закрыта — зелёным
+            X.color_scale(ws, rng(7))                  # прод 7д
+            X.color_scale(ws, rng(8))                  # среднее
+            X.color_scale(ws, rng(9))                  # ср/28 дней
+            X.color_scale(ws, rng(12))                 # на сколько дней хватит
 
         X.set_widths(ws, [34, 30.6, 14.9, 14.9, 14.9, 9, 10, 10, 11, 11, 11, 14.9])
         ws.freeze_panes = "C2"

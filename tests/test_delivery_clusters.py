@@ -245,10 +245,15 @@ class Cfg:
     OUTPUT_DIR = "/tmp/_delivtest/out"
 
 
+TOTAL = "все кластеры"
+
+
 def build(store):
+    """«прод 7д» по кластерам; итоговая строка позиции не в счёт."""
     ws = load_workbook(R.build_stocks([store], Cfg()))["ТЕСТ"]
     return {ws.cell(r, 2).value: ws.cell(r, 7).value
-            for r in range(2, ws.max_row + 1) if ws.cell(r, 2).value}
+            for r in range(2, ws.max_row + 1)
+            if ws.cell(r, 2).value and ws.cell(r, 2).value != TOTAL}
 
 
 ORDERS = {"ART-1": {"Москва": {DAYS7[0]: 40.0, DAYS7[3]: 20.0},

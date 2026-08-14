@@ -80,11 +80,15 @@ class Cfg:
     OUTPUT_DIR = "/tmp/_clneeds/out"
 
 
+TOTAL = "все кластеры"
+
+
 def build(store):
+    """Строки по кластерам; итоговая строка позиции пропускается."""
     ws = load_workbook(R.build_stocks([store], Cfg()))["ТЕСТ"]
     out = {}
     for r in range(2, ws.max_row + 1):
-        if ws.cell(r, 2).value:
+        if ws.cell(r, 2).value and ws.cell(r, 2).value != TOTAL:
             out[ws.cell(r, 2).value] = {
                 "sold7": ws.cell(r, 7).value,
                 "ads28": ws.cell(r, 9).value,
@@ -115,9 +119,9 @@ check("порядок колонок не съехал",
 
 print("\n4. Потребность считается от своего кластера")
 check("формула потребности смотрит на среднее и итог своей строки",
-      res["Москва"]["need30"] == "=H2*30-F2", res["Москва"]["need30"])
+      res["Москва"]["need30"] == "=H3*30-F3", res["Москва"]["need30"])
 check("зелёная подсветка закрытой потребности переехала на J:K",
-      any("J2" in str(rng.sqref) for rng in ws.conditional_formatting),
+      any(str(rng.sqref).startswith("J") for rng in ws.conditional_formatting),
       [str(rng.sqref) for rng in ws.conditional_formatting])
 
 print("\n5. Запасные пути, когда данных меньше")
@@ -197,9 +201,9 @@ class Store2(Store):
 
 ws2 = load_workbook(R.build_stocks([Store2()], Cfg()))["ТЕСТ"]
 rows2 = {ws2.cell(r, 2).value: r for r in range(2, ws2.max_row + 1)
-         if ws2.cell(r, 2).value}
+         if ws2.cell(r, 2).value and ws2.cell(r, 2).value != TOTAL}
 check("восемь складских строк свернулись в два кластера",
-      ws2.max_row - 1 == 2, ws2.max_row - 1)
+      len(rows2) == 2, sorted(rows2))
 check("кластер назван один раз", set(rows2) == {"Москва, МО и Дальние регионы",
                                                "Ростов"}, set(rows2))
 msk = rows2["Москва, МО и Дальние регионы"]

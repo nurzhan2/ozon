@@ -557,9 +557,12 @@ def load_drive(store_name, folder_id, credentials_file):
     subs = drive.files().list(q=q, fields="files(id,name)").execute().get("files", [])
     sub = next((s for s in subs if _norm(s["name"]) == _norm(store_name)), None)
     if not sub:
-        log.info("[%s] на Диске нет подпапки с таким именем — пропускаю",
-                 store_name)
-        return {}
+        # Раньше здесь возвращался пустой {}, а вызывающий код лез в
+        # data["metrics"] — вместо понятной причины в лог уходило
+        # «Google Диск недоступен ('metrics')». Возвращаем правильную форму.
+        log.warning("[%s] на Диске нет подпапки с таким именем. Есть: %s",
+                    store_name, ", ".join(s["name"] for s in subs) or "ни одной")
+        return _empty()
 
     q = f"'{sub['id']}' in parents and trashed = false"
     files = drive.files().list(
@@ -567,9 +570,10 @@ def load_drive(store_name, folder_id, credentials_file):
         fields="files(id,name,mimeType,modifiedTime)").execute().get("files", [])
     files = [f for f in files if f["mimeType"] != "application/vnd.google-apps.folder"]
     if not files:
-        log.info("[%s] подпапка на Диске пуста — пропускаю", store_name)
-        return {}
+        log.warning("[%s] подпапка «%s» на Диске пуста", store_name, sub["name"])
+        return _empty()
 
+    log.info("[%s] в подпапке на Диске файлов: %d", store_name, len(files))
     out, days, bad, n_ord = _empty(), set(), 0, 0
     for f in files:
         if f["mimeType"] == "application/vnd.google-apps.spreadsheet":
@@ -609,10 +613,27 @@ def load(store_name, cfg):
     Данные кабинета для магазина. Сначала Диск, если он настроен, потом
     локальная папка. Любая ошибка — предупреждение, а не падение сбора:
     отсутствие выгрузки не должно ронять остальные четыре отчёта.
+
+    Про логи отдельно. Раньше молчаливых путей было два: не задан
+    GOOGLE_IMPORT_FOLDER и нет локальной папки. В обоих случаях в логе не
+    появлялось НИ ОДНОЙ строки про кабинет, и снаружи это выглядело так же,
+    как «файлы положили, а корзина пустая» — заказчик именно так и решил.
+    Разбор занял вечер и чтение исходников. Теперь каждый прогон пишет,
+    каким источником он воспользовался и почему.
     """
     folder = getattr(cfg, "GOOGLE_IMPORT_FOLDER", "") or ""
     creds = getattr(cfg, "GOOGLE_CREDENTIALS_FILE", "") or ""
-    if folder and creds and os.path.exists(creds):
+    local = os.path.join(getattr(cfg, "DATA_DIR", "data"), "import", store_name)
+
+    if not folder:
+        log.info("[%s] GOOGLE_IMPORT_FOLDER не задан — выгрузка из кабинета "
+                 "не используется, «корзина» и «%% корзины» останутся пустыми. "
+                 "Локальная папка: %s", store_name, local)
+    elif not creds or not os.path.exists(creds):
+        log.warning("[%s] GOOGLE_IMPORT_FOLDER задан, но ключа сервисного "
+                    "аккаунта нет (%s) — Диск пропускаю",
+                    store_name, creds or "путь пуст")
+    else:
         try:
             data = load_drive(store_name, folder, creds)
             if data["metrics"] or data["orders"]:
@@ -622,8 +643,13 @@ def load(store_name, cfg):
         except Exception as e:  # сеть, права, отозванный ключ
             log.warning("[%s] Google Диск недоступен (%s) — смотрю локально",
                         store_name, str(e)[:200])
+
     try:
-        return load_local(store_name, getattr(cfg, "DATA_DIR", "data"))
+        out = load_local(store_name, getattr(cfg, "DATA_DIR", "data"))
     except CabinetImportError as e:
         log.warning("[%s] локальную выгрузку не разобрал: %s", store_name, e)
         return _empty()
+    if not out["metrics"] and not out["orders"] and not os.path.isdir(local):
+        log.info("[%s] локальной папки с выгрузками нет (%s) — источников "
+                 "кабинета не осталось", store_name, local)
+    return out
