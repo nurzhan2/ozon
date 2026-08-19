@@ -439,7 +439,8 @@ def _quality_rows_for(filled):
             for label, key, fmt in QUALITY_ROWS]
 
 
-def _quality_day_values(d, unified=False, has_views=True, has_cart=True):
+def _quality_day_values(d, unified=False, has_views=True, has_cart=True,
+                        has_position=None):
     """
     Расчёт производных показателей за один день по образцу.
 
@@ -447,6 +448,12 @@ def _quality_day_values(d, unified=False, has_views=True, has_cart=True):
     кабинета), тогда CTR считается по ним. Иначе показы из поиска, а клики
     только рекламные, и делить одно на другое бессмысленно: CTR берётся по
     рекламной паре, а строка подписана «(реклама)».
+
+    has_position задаётся отдельно от has_views нарочно. Пока показы и место
+    в поиске оба приходили из product-queries, одного признака хватало. Из
+    выгрузки кабинета место в поиске приходит («Позиция в поиске и каталоге»),
+    а показов там нет вовсе — и на общем признаке позиция обнулялась бы
+    вместе с показами. None — вести себя как раньше, по has_views.
 
     has_views / has_cart = False — за этот день источник данных не отдал
     НИЧЕГО. Тогда в клетке пусто, а не ноль. Разница принципиальная: OZON
@@ -465,6 +472,8 @@ def _quality_day_values(d, unified=False, has_views=True, has_cart=True):
     cancel = d.get("cancellations", 0) or 0
     revenue = d.get("revenue", 0) or 0
     spend = d.get("ad_spend", 0) or 0
+    if has_position is None:
+        has_position = has_views
     return {
         "hits_view": int(round(views)) if has_views else None,
         "session_view": int(round(clicks)),
@@ -479,7 +488,7 @@ def _quality_day_values(d, unified=False, has_views=True, has_cart=True):
         "bought": int(round(max(ordered - cancel, 0))),
         "cancellations": int(round(cancel)),
         "position_category": (int(round(d.get("position_category", 0) or 0))
-                              if has_views else None),
+                              if has_position else None),
         "revenue": round(revenue),
         "ad_spend": round(spend),
         "drr": _safe_div(spend, revenue),
@@ -580,7 +589,7 @@ def _quality_write_block(ws, r, title, days, vals_by_day, day_keys, with_total,
 
 
 def _quality_store_totals(items, day_keys, unified=False,
-                          views_days=None, cart_days=None):
+                          views_days=None, cart_days=None, pos_days=None):
     """
     Свод по магазину на каждый день — блок «по аналитике».
     Аддитивные метрики складываются, «место в поиске» усредняется по товарам
@@ -609,7 +618,8 @@ def _quality_store_totals(items, day_keys, unified=False,
         out[k] = _quality_day_values(
             acc, unified,
             has_views=(views_days is None or k in views_days),
-            has_cart=(cart_days is None or k in cart_days))
+            has_cart=(cart_days is None or k in cart_days),
+            has_position=(pos_days is None or k in pos_days))
     return out
 
 
@@ -646,17 +656,21 @@ def build_quality(collectors, cfg):
         # выводятся пустыми, а не нулями.
         v_days = getattr(colr, "days_with_views", set()) or set()
         c_days = getattr(colr, "days_with_cart", set()) or set()
+        # место в поиске приходит и оттуда, где показов нет, — см. _quality_day_values
+        p_days = getattr(colr, "days_with_position", None)
+        p_days = v_days if p_days is None else (p_days or set())
 
         def _vals(day_dict, k):
             return _quality_day_values(day_dict, unified,
                                        has_views=k in v_days,
-                                       has_cart=k in c_days)
+                                       has_cart=k in c_days,
+                                       has_position=k in p_days)
 
         # --- сводный блок по магазину ---
         empty_keys = []
         if items:
             store_totals = _quality_store_totals(items, day_keys, unified,
-                                                 v_days, c_days)
+                                                 v_days, c_days, p_days)
             empty_keys = _quality_empty_keys(store_totals, day_keys)
             r = _quality_write_block(ws, r, "по аналитике", days,
                                      store_totals, day_keys, with_total,

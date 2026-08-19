@@ -97,6 +97,10 @@ class StoreCollector:
         # с задержкой в день-два, и на свежей колонке ноль был бы враньём.
         self.days_with_views = set()
         self.days_with_cart = set()
+        # Место в поиске приходит и там, где показов нет: в выгрузке кабинета
+        # есть «Позиция в поиске и каталоге», а колонки показов нет. Общий
+        # признак обнулял бы позицию заодно с показами.
+        self.days_with_position = set()
         # взводится после двух отказов product-queries подряд, см. queries_by_day
         self._queries_off = False
         # Отмены из отправлений — по периодам.
@@ -272,7 +276,10 @@ class StoreCollector:
         q = self.queries_by_day(df, dt)
         if q:
             P.merge_queries(result, q, sku_map)
-            self.days_with_views |= {d for d, items in q.items() if items}
+            # product-queries отдаёт показы и позицию вместе
+            got = {d for d, items in q.items() if items}
+            self.days_with_views |= got
+            self.days_with_position |= got
         # отмены из отправлений — точные, без подписки
         c = self.cancels(df, dt)
         if c:
@@ -283,9 +290,19 @@ class StoreCollector:
         if cab:
             self.cabinet_filled = P.merge_cabinet(result, cab, sku_map)
             cab_days = {day for days in cab.values() for day in days}
-            self.days_with_views |= cab_days
+            # По дню отмечаем только то, что выгрузка РЕАЛЬНО принесла.
+            # Раньше сюда шли все дни файла целиком, и это ровно тот случай,
+            # который заказчик уже ловил: в наборе кабинета показов нет
+            # вовсе — только «Уникальные посетители, всего», — и строка
+            # «показы» напечаталась бы нулём рядом с пятью тысячами кликов,
+            # а CTR стал бы 0,0%. Ноль показов означал бы, что товар никто
+            # не видел; пустая клетка говорит правду: источника нет.
+            if "hits_view" in self.cabinet_filled:
+                self.days_with_views |= cab_days
             if "hits_tocart" in self.cabinet_filled:
                 self.days_with_cart |= cab_days
+            if "position_category" in self.cabinet_filled:
+                self.days_with_position |= cab_days
         self._daily_cache[key] = (result, order)
         return result, order
 
