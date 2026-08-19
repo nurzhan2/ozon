@@ -49,8 +49,19 @@ def _slice_days(data, date_from, date_to):
 
 
 class StoreCollector:
-    def __init__(self, store_cfg, enable_performance=True, exclude_marker="OUT"):
+    def __init__(self, store_cfg, enable_performance=True, exclude_marker="OUT",
+                 app_cfg=None):
+        # ВНИМАНИЕ, здесь легко ошибиться и один раз уже ошиблись.
+        # self.cfg — это СЛОВАРЬ ОДНОГО МАГАЗИНА из OZON_STORES: name,
+        # client_id, api_key, perf_*. В нём нет и не может быть ни
+        # GOOGLE_IMPORT_FOLDER, ни DATA_DIR — это переменные всего сервиса,
+        # они живут в модуле config. Раньше выгрузка кабинета читалась как
+        # CAB.load(self.name, self.cfg), то есть спрашивала папку у словаря
+        # магазина и всегда получала пусто. Импорт из кабинета не работал
+        # никогда, а в логе честно писалось «GOOGLE_IMPORT_FOLDER не задан» —
+        # переменная-то в Railway стояла.
         self.cfg = store_cfg
+        self.app_cfg = app_cfg
         self.name = store_cfg["name"]
         self.exclude_marker = exclude_marker
         self.enable_performance = enable_performance
@@ -291,10 +302,28 @@ class StoreCollector:
         """
         return self._cabinet_all().get("orders") or {}
 
+    def _settings(self):
+        """
+        Настройки всего сервиса, а не магазина. Обычно приходят параметром
+        из worker.py / run.py; если вызвали без них — берём модуль config
+        сами, чтобы выгрузка кабинета не отключилась молча.
+        """
+        if self.app_cfg is not None:
+            return self.app_cfg
+        try:
+            import config as _cfg
+        except Exception as e:
+            log.warning("[%s] настройки сервиса недоступны (%s) — выгрузка "
+                        "кабинета пропущена", self.name, e)
+            return None
+        self.app_cfg = _cfg
+        return _cfg
+
     def _cabinet_all(self):
         if self._cabinet is None:
             try:
-                self._cabinet = CAB.load(self.name, self.cfg) or CAB._empty()
+                self._cabinet = (CAB.load(self.name, self._settings())
+                                 or CAB._empty())
             except Exception as e:      # источник необязательный, сбор важнее
                 log.warning("[%s] выгрузку кабинета прочитать не удалось: %s",
                             self.name, str(e)[:200])

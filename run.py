@@ -47,6 +47,7 @@ def build_collectors(store_filter=None):
             st,
             enable_performance=getattr(config, "ENABLE_PERFORMANCE", True),
             exclude_marker=getattr(config, "EXCLUDE_ARTICLE_MARKER", "OUT"),
+            app_cfg=config,
         ))
     return cols
 

@@ -59,7 +59,8 @@ def build_collectors():
     return [
         StoreCollector(st,
                        enable_performance=config.ENABLE_PERFORMANCE,
-                       exclude_marker=config.EXCLUDE_ARTICLE_MARKER)
+                       exclude_marker=config.EXCLUDE_ARTICLE_MARKER,
+                       app_cfg=config)
         for st in config.STORES
     ]
 

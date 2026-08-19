@@ -621,6 +621,22 @@ def load(store_name, cfg):
     Разбор занял вечер и чтение исходников. Теперь каждый прогон пишет,
     каким источником он воспользовался и почему.
     """
+    # Сюда должны прийти настройки СЕРВИСА (модуль config), а не словарь
+    # магазина из OZON_STORES. Один раз пришёл словарь: getattr по нему
+    # молча вернул пустую строку, импорт кабинета не работал вообще, а в
+    # логе стояло «GOOGLE_IMPORT_FOLDER не задан» при заданной переменной.
+    # Теперь такая подмена видна сразу.
+    if isinstance(cfg, dict) or (cfg is not None and hasattr(cfg, "get")
+                                 and not hasattr(cfg, "DATA_DIR")):
+        log.error("[%s] в выгрузку кабинета передали настройки магазина "
+                  "вместо настроек сервиса — папку взять неоткуда. Это "
+                  "ошибка в коде, а не в переменных окружения", store_name)
+        return _empty()
+    if cfg is None:
+        log.warning("[%s] настроек сервиса нет — выгрузка кабинета пропущена",
+                    store_name)
+        return _empty()
+
     folder = getattr(cfg, "GOOGLE_IMPORT_FOLDER", "") or ""
     creds = getattr(cfg, "GOOGLE_CREDENTIALS_FILE", "") or ""
     local = os.path.join(getattr(cfg, "DATA_DIR", "data"), "import", store_name)
